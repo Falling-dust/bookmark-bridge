@@ -1,0 +1,8 @@
+{
+  "name": "bookmark-bridge",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Local-first bookmark transfer for Chrome and Edge",
+  "scripts": { "test": "node --test tests/*.test.mjs", "test:browser": "node scripts/browser-test.mjs", "preview": "node scripts/serve.mjs", "package": "python scripts/package.py" }
+}

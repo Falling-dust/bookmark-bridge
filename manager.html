@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Bookmark Bridge — Your bookmarks, everywhere</title>
+  <link rel="icon" href="icons/mark.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="styles.css">
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+  <a class="skip-link" href="#workspace">Skip to workspace</a>
+  <div class="app-shell">
+    <aside class="sidebar" aria-label="App navigation">
+      <a class="brand" href="manager.html" aria-label="Bookmark Bridge home"><img src="icons/mark.svg" alt="" width="38" height="38"><span>Bookmark<span class="brand-second">Bridge<span class="brand-dot">.</span></span></span></a>
+      <div class="sidebar-label">WORKSPACE</div>
+      <nav class="main-nav" aria-label="Workspace">
+        <button type="button" class="nav-button active" data-view="export" aria-current="page"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 15V3m0 0-4 4m4-4 4 4M5 13v6a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-6"/></svg><span>Export bookmarks</span><span class="nav-arrow">↗</span></button>
+        <button type="button" class="nav-button" data-view="import"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 3v12m0 0 4-4m-4 4-4-4M5 13v6a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-6"/></svg><span>Import & organize</span><span class="nav-arrow">↗</span></button>
+        <button type="button" class="nav-button" data-view="history"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M3 11a9 9 0 1 1 2.2 7M3 4v7h7m2-4v5l3 2"/></svg><span>Transfer history</span><span class="nav-arrow">↗</span></button>
+      </nav>
+      <div class="sidebar-divider"></div>
+      <section class="library-card" aria-label="Your browser library"><span class="sidebar-label">YOUR LIBRARY</span><p id="library-summary">Connecting to your bookmarks…</p><span class="local-label"><span class="status-dot"></span> Saved in your browser</span></section>
+      <div class="sidebar-spacer"></div>
+      <section class="journey-card"><span class="journey-icon" aria-hidden="true">↗</span><h2>A little order.<br>A fresh start.</h2><p>Keep the corners of the web<br>that matter to you.</p><ol><li>Pick your bookmarks</li><li>Arrange your collection</li><li>Take it anywhere</li></ol></section>
+      <div class="sidebar-bottom"><button type="button" id="help-button" class="help-button"><span aria-hidden="true">?</span> Quick guide</button><span class="version">v1.0</span></div>
+      <p id="privacy-note" class="privacy-note"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 4 6v6c0 4 8 9 8 9s8-5 8-9V6l-8-3Z"/><path d="m8.5 11.5 2.5 2.5 4.5-5"/></svg>Your bookmarks stay yours. Always local.</p>
+    </aside>
+    <div class="main-shell">
+      <header class="page-header"><div><div class="header-kicker"><span class="header-kicker-line"></span> A PLACE FOR EVERYTHING</div><h1 id="view-title">Export bookmarks</h1><p id="view-subtitle">A thoughtfully packed collection, ready for its next browser.</p></div><div class="top-actions"><span class="badge" id="demo-badge" hidden>Demo library</span><button id="refresh-button" class="button secondary" type="button"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M20 10a8 8 0 0 0-14-5L3 8m0-5v5h5M4 14a8 8 0 0 0 14 5l3-3m0 5v-5h-5"/></svg>Refresh library</button></div></header>
+      <main id="workspace" tabindex="-1" aria-label="Bookmark workspace"></main>
+      <footer class="app-footer"><span>Made for your next move.</span><span>Chrome & Edge <span class="footer-dot">·</span> No account needed</span></footer>
+    </div>
+  </div>
+  <div id="toast" role="status" aria-live="polite"></div>
+  <div id="busy-overlay" class="busy-overlay" hidden><div class="busy-card"><span class="spinner" aria-hidden="true"></span><p>Organizing your bookmarks…</p></div></div>
+</body>
+</html>

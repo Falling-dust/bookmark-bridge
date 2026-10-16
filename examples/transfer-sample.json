@@ -1,0 +1,65 @@
+{
+  "format": "bookmark-bridge",
+  "version": 1,
+  "children": [
+    {
+      "id": "sample-research",
+      "title": "Research & reading",
+      "children": [
+        {
+          "id": "sample-mdn",
+          "title": "MDN Web Docs",
+          "dateAdded": 1735689600000,
+          "url": "https://developer.mozilla.org/"
+        },
+        {
+          "id": "sample-guides",
+          "title": "Guides",
+          "children": [
+            {
+              "id": "sample-query-one",
+              "title": "Search: browser extensions",
+              "url": "https://example.com/search?q=browser&topic=extensions"
+            },
+            {
+              "id": "sample-query-two",
+              "title": "Search: bookmarks",
+              "url": "https://example.com/search?q=bookmarks&topic=extensions"
+            },
+            {
+              "id": "sample-fragment",
+              "title": "Guide — import section",
+              "url": "https://example.com/guide/#import"
+            }
+          ]
+        },
+        {
+          "id": "sample-empty",
+          "title": "Read later",
+          "children": []
+        }
+      ]
+    },
+    {
+      "id": "sample-design",
+      "title": "Design inspiration",
+      "children": [
+        {
+          "id": "sample-smashing",
+          "title": "Smashing Magazine",
+          "url": "https://www.smashingmagazine.com/"
+        },
+        {
+          "id": "sample-mdn-again",
+          "title": "MDN — also useful for design",
+          "url": "https://developer.mozilla.org/"
+        }
+      ]
+    },
+    {
+      "id": "sample-standalone",
+      "title": "A standalone bookmark",
+      "url": "https://example.com/"
+    }
+  ]
+}
