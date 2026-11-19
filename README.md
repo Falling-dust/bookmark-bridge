@@ -29,11 +29,11 @@ Use a current Chrome or Edge release; the extension declares Chrome 109 as its m
 
 1. Open **Import** and choose or drop an HTML or JSON bookmark file.
 2. Select the incoming bookmarks and folders to include. Each selected top-level item can have its own destination folder; nested items retain their folder structure. To remove a wrapper such as **Bookmarks bar**, click **Use folder contents**. This promotes the selected top-level folders' contents by one level and preserves their destination settings. Repeat for deeper folders, or reload the file to restore its original structure.
-3. Choose whether duplicate URLs are skipped or kept, whether duplicate detection applies to each destination folder or the whole browser, and whether identically named folders should be merged.
-4. Place new items at the beginning or end of their destination folders. Review the complete plan before clicking **Import**. **Save review** downloads the action list for larger imports.
-5. Open **History** to review the import or undo its created items.
+3. Choose whether duplicate URLs are skipped, kept, or handled individually with **Review each match**. Set duplicate detection to each destination folder or the whole browser, and choose whether identically named folders should be merged.
+4. Place new items at the beginning or end of their destination folders, then click **Review import**. If reviewing matches, compare the incoming and local titles and URLs, select the intended local bookmark when several match, and resolve every match before applying the import. **Save review** downloads the complete action list.
+5. Click **Apply import** when the preview is ready. Open **History** to review the import or undo its additions and updates.
 
-If the bookmark library changes after the preview in a way that changes the plan, the import stops and asks for a fresh preview. Existing bookmarks are never deleted, replaced, or moved during import. Managed folders cannot be used as destinations.
+If the bookmark library changes after the preview in a way that changes the plan, the import stops and asks for a fresh preview. Existing bookmarks are updated only when you choose **Replace** or **Merge** for a reviewed match. These actions preserve the selected bookmark's ID and folder; imports do not delete or move existing bookmarks. Managed folders cannot be used as destinations.
 
 Try [examples/transfer-sample.html](examples/transfer-sample.html) or [examples/transfer-sample.json](examples/transfer-sample.json) in the local demo before using your own data. The examples include nested folders, an empty folder, a repeated URL, and URLs with distinct query strings or fragments.
 
@@ -44,11 +44,24 @@ Try [examples/transfer-sample.html](examples/transfer-sample.html) or [examples/
 - Folder merging uses exact, case-sensitive folder names within the chosen destination. Repeated incoming folders with the same name can also merge. Turn merging off to create separate folders.
 - Empty folders are supported. Browser-specific root wrappers are initially preserved when importing standard exports. **Use folder contents** lets you place the contents directly into existing browser folders. You can also omit root wrappers when exporting.
 
+**Review each match** is optional. The default remains **Skip the incoming duplicate**; **Keep both bookmarks** applies to all matches when individual review is unnecessary. In review mode, each matching URL has these choices:
+
+| Choice | Result |
+| --- | --- |
+| **Skip** | Leave the local bookmark unchanged and omit the incoming duplicate. |
+| **Keep both** | Leave the local bookmark unchanged and add the incoming bookmark to its chosen destination. |
+| **Replace** | Update the selected local bookmark with the incoming title and URL, retaining its ID and folder. |
+| **Merge** | Join distinct local and incoming titles with ` · `, retaining the local bookmark's stored URL, ID, and folder. Identical titles are not repeated. |
+
+For example, matching titles **Research notes** and **Reference library** can become **Research notes · Reference library**. A merge combines bookmark names; it does not combine the contents of the web pages.
+
+When several local bookmarks match a URL, choose the exact target in the match's selector. With **Across the whole browser**, that target may be in another folder; replacing or merging updates it where it already lives. The incoming destination applies to newly created bookmarks. Duplicates that exist only earlier in the same imported file, and matches in managed or otherwise read-only locations, offer **Skip** and **Keep both** only. A file containing only updates can still be applied; an unresolved match or a plan containing only skipped items cannot be committed.
+
 ## Undo and interrupted imports
 
-Undo removes bookmarks only when their saved IDs, parent folders, titles, and URLs still match the import record. Folders created by the import are removed only when empty. Edited items, items moved to another folder, and folders containing other content are preserved. Existing folders that received merged content are never removed.
+Undo removes newly created bookmarks only when their saved IDs, parent folders, titles, and URLs still match the import record. For **Replace** and **Merge**, it restores the previous title and URL only when the bookmark still matches the recorded imported result. Later user edits or moves are preserved. Folders created by the import are removed only when empty; folders containing other content are preserved. Existing folders that received merged content are never removed.
 
-History is stored in this extension's local browser storage. Undo requires that history and applies to imports made in that browser profile. If an import is interrupted, open History to review or undo the recorded creations before importing again. If creation completed but its returned ID was not saved, the uncertain item is left untouched and a recovery warning requests manual review. Clearing extension data or uninstalling it removes its history.
+History is stored in this extension's local browser storage. Undo requires that history and applies to imports made in that browser profile. If an import is interrupted, open History to review or undo the recorded changes before importing again. If creation completed but its returned ID was not saved, the uncertain item is left untouched and a recovery warning requests manual review. Clearing extension data or uninstalling it removes its history.
 
 ## Privacy, formats, and limits
 
@@ -62,7 +75,7 @@ Supported input:
 
 Files are limited to 20 MB, 100,000 entries, and 100 nested levels. The interface shows the first 300 preview actions; **Save review** includes all actions. Malformed entries and unsupported URLs are reported. Allowed URL schemes are `http`, `https`, `ftp`, `file`, `mailto`, `chrome`, `edge`, and `about`; executable bookmarklets and `data:` URLs are excluded. Exports reject unsupported selected URLs rather than silently dropping them.
 
-Each import can create up to 5,000 bookmarks and folders. Select smaller batches for larger transfers. Before writing bookmarks, the extension checks that enough local storage remains for its undo journal. Journal records are stored in chunks so large imports do not repeatedly rewrite the entire history.
+Each import can perform up to 5,000 bookmark or folder creations and bookmark updates combined. Select smaller batches for larger transfers. Before writing bookmarks, the extension checks that enough local storage remains for its undo journal. Journal records are stored in chunks so large imports do not repeatedly rewrite the entire history.
 
 HTML is parsed as inert text. Tags, favicons, keywords, and other browser-specific metadata are not transferred. Export files preserve available creation dates, but imported items receive browser-assigned creation dates because the browser creation API does not accept historical dates. File URLs and browser-specific internal pages may be useful only on their original computer or browser.
 
@@ -85,7 +98,7 @@ npm run test:browser
 node scripts/make-icons.mjs
 ```
 
-`npm run test:browser` runs UI and real Manifest V3 integration checks using Playwright and an isolated Edge profile. Install Edge before running it; `BROWSER_CHANNEL` can override the channel. It does not use your normal browser profile. Screenshots are saved under `test-results/`. `node scripts/make-icons.mjs` regenerates the bundled PNG icons from `icons/mark.svg` using Sharp; the generated icons are already included, so ordinary use does not require this step.
+`npm run test:browser` runs UI and real Manifest V3 integration checks using Playwright and a fresh isolated Edge profile for each run. Checks cover all four overlap decisions, selecting among multiple local matches, destination versus browser-wide matching, update-only imports, and undo that preserves subsequent user edits. Install Edge before running it; `BROWSER_CHANNEL` can override the channel. It does not use your normal browser profile. Screenshots are saved under `test-results/`. `node scripts/make-icons.mjs` regenerates the bundled PNG icons from `icons/mark.svg` using Sharp; the generated icons are already included, so ordinary use does not require this step.
 
 Both tools resolve packages from the local installation by default. To use an existing installation elsewhere, set `PLAYWRIGHT_MODULE` to the path of Playwright's `index.mjs`, or `SHARP_MODULE` to the installed Sharp package directory or its entry file. Explicit overrides take precedence over local packages.
 
@@ -99,8 +112,9 @@ Source layout:
 
 - `app.js`: selection, export ordering, placement controls, previews, and history UI.
 - `lib/formats.js`: inert HTML parsing, JSON adapters, validation, and serialization.
-- `lib/planner.js`: deterministic duplicate detection and non-destructive import planning.
-- `lib/operations.js`: browser writes, persistent creation records, and conservative undo.
+- `lib/planner.js`: deterministic duplicate detection, per-match decisions, and import planning.
+- `lib/duplicate-review.js`: local-versus-incoming comparison and overlap decision controls.
+- `lib/operations.js`: browser writes, persistent creation and update records, and conservative undo.
 - `background.js`: Manifest V3 service worker and serialized mutation requests.
 - `lib/demo.js`: isolated browser API substitute for the local demo.
 - `tests/`: automated parser, planning, and operation tests.

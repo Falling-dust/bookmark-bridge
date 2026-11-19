@@ -9,10 +9,10 @@ const folder = (title, children = []) => ({ title, children });
 const entry = (node, destinationId = '1') => ({ node, destinationId });
 
 /** A stateful mock with Chrome-style structured cloning and nonrecursive remove. */
-function makeApi({ history = [], failCreateAt = 0, quotaBytes = 10 * 1024 * 1024, storageOverhead = 0 } = {}) {
+function makeApi({ history = [], failCreateAt = 0, failUpdateAt = 0, canonicalizeUpdates = false, quotaBytes = 10 * 1024 * 1024, storageOverhead = 0 } = {}) {
   const nodes = new Map();
   const data = { importHistory: clone(history) };
-  const calls = { creates: [], removes: [], storageWrites: 0, maxJournalChunk: 0, journalRecordsWritten: 0, storageRemovals: [] };
+  const calls = { creates: [], updates: [], removes: [], storageWrites: 0, maxJournalChunk: 0, journalRecordsWritten: 0, maxUpdateChunk: 0, updateRecordsWritten: 0, storageRemovals: [] };
   let nextId = 100;
   function add(node, parentId) {
     const children = node.children;
@@ -65,6 +65,10 @@ function makeApi({ history = [], failCreateAt = 0, quotaBytes = 10 * 1024 * 1024
           calls.maxJournalChunk = Math.max(calls.maxJournalChunk, value.length);
           calls.journalRecordsWritten += value.length;
         }
+        for (const [key, value] of Object.entries(values)) if (key.startsWith('importUpdates:')) {
+          calls.maxUpdateChunk = Math.max(calls.maxUpdateChunk, value.length);
+          calls.updateRecordsWritten += value.length;
+        }
         Object.assign(data, clone(values));
       },
       async remove(keys) { for (const key of Array.isArray(keys) ? keys : [keys]) { delete data[key]; calls.storageRemovals.push(key); } },
@@ -81,6 +85,15 @@ function makeApi({ history = [], failCreateAt = 0, quotaBytes = 10 * 1024 * 1024
         calls.creates.push(clone(details));
         if (failCreateAt && calls.creates.length === failCreateAt) throw new Error('Simulated create failure');
         return create(details);
+      },
+      async update(id, changes) {
+        calls.updates.push({ id, changes: clone(changes) });
+        if (failUpdateAt && calls.updates.length === failUpdateAt) throw new Error('Simulated update failure');
+        const node = lookup(id);
+        if (node.url === undefined) throw new Error('Only bookmarks can be updated by this mock.');
+        if (Object.hasOwn(changes, 'title')) node.title = changes.title;
+        if (Object.hasOwn(changes, 'url')) node.url = canonicalizeUpdates ? new URL(changes.url).href : changes.url;
+        return copyNode(id);
       },
       async remove(id) {
         const node = lookup(id);
@@ -370,4 +383,309 @@ test('a batch above the write cap fails before mutation with an actionable batch
   await assert.rejects(runImport(mock.api, await mock.preview(entries)), /per import.*another batch/);
   assert.equal(mock.calls.creates.length, 0);
   assert.equal(mock.calls.storageWrites, 0);
+});
+
+const reviewedBookmark = (id, title, url = 'https://existing.example/') => ({ id, title, url });
+const reviewOptions = duplicateDecisions => ({ duplicatePolicy: 'review', duplicateScope: 'global', duplicateDecisions });
+
+test('mixed reviewed choices create, skip, replace and merge exactly the selected bookmarks and undo all changes', async () => {
+  const mock = makeApi();
+  const before = await mock.api.bookmarks.getTree();
+  const entries = [
+    entry(reviewedBookmark('skip', 'Skipped docs', 'https://docs.example/')),
+    entry(reviewedBookmark('keep', 'Separate copy')),
+    entry(reviewedBookmark('replace', 'Replacement title')),
+    entry(reviewedBookmark('merge', 'Additional docs title', 'https://docs.example/')),
+  ];
+  const options = reviewOptions({
+    'id:skip': { choice: 'skip' }, 'id:keep': { choice: 'keep' },
+    'id:replace': { choice: 'replace', targetId: '10' }, 'id:merge': { choice: 'merge', targetId: '12' },
+  });
+  const job = await runImport(mock.api, await mock.preview(entries, options));
+  assert.equal(job.status, 'complete');
+  assert.deepEqual(job.stats, { bookmarks: 1, folders: 0, merged: 0, skipped: 1, updated: 2 });
+  assert.equal(job.created.length, 1);
+  assert.equal(job.updated.length, 2);
+  assert.equal(mock.calls.creates.length, 1);
+  assert.deepEqual(mock.calls.updates.map(call => call.id), ['10', '12']);
+  assert.equal(mock.nodes.get('10').title, 'Replacement title');
+  assert.equal(mock.nodes.get('10').parentId, '1');
+  assert.equal(mock.nodes.get('12').title, 'Docs · Additional docs title');
+  assert.equal(mock.nodes.get('12').parentId, '11');
+  assert.deepEqual((await getHistory(mock.api))[0], job);
+  const undone = await undoImport(mock.api, job.id);
+  assert.equal(undone.status, 'undone');
+  assert.equal(undone.updated.length, 0);
+  assert.deepEqual(await mock.api.bookmarks.getTree(), before);
+  assert.deepEqual(mock.calls.removes, job.created.map(record => record.id));
+});
+
+test('an update-only import persists before and after snapshots and restores the original bookmark ID', async () => {
+  const mock = makeApi();
+  const options = reviewOptions({ 'id:rename': { choice: 'replace', targetId: '10' } });
+  const job = await runImport(mock.api, await mock.preview([entry(reviewedBookmark('rename', 'Replaced'))], options));
+  assert.deepEqual(job.created, []);
+  assert.equal(job.updated.length, 1);
+  assert.equal(job.updated[0].id, '10');
+  assert.deepEqual(job.updated[0].before, { title: 'Existing', url: 'https://existing.example/', parentId: '1' });
+  assert.deepEqual(job.updated[0].after, { title: 'Replaced', url: 'https://existing.example/', parentId: '1' });
+  const raw = mock.storageData.importHistory[0];
+  assert.equal(raw.journalVersion, 2);
+  assert.equal(raw.createdCount, 0);
+  assert.equal(raw.updatedCount, 1);
+  assert.equal(raw.updated, undefined);
+  const [reloaded] = await getHistory(mock.api);
+  assert.deepEqual(reloaded.updated, job.updated);
+  const undone = await undoImport(mock.api, reloaded.id);
+  assert.equal(undone.status, 'undone');
+  assert.equal(mock.nodes.get('10').title, 'Existing');
+  assert.equal(mock.nodes.get('10').parentId, '1');
+  assert.equal(mock.calls.creates.length, 0);
+  assert.equal(mock.calls.removes.length, 0);
+  assert.equal(Object.keys(mock.storageData).some(key => key.startsWith(`importUpdates:${job.id}:`)), false);
+});
+
+test('resolved no-op replacements and merges never call the update API', async () => {
+  for (const choice of ['replace', 'merge']) {
+    const mock = makeApi();
+    const job = await runImport(mock.api, await mock.preview([entry(reviewedBookmark('same', 'Existing'))], reviewOptions({ 'id:same': { choice, targetId: '10' } })));
+    assert.equal(job.stats.updated, 0);
+    assert.deepEqual(job.updated, []);
+    assert.equal(mock.calls.updates.length, 0);
+    assert.equal(mock.calls.creates.length, 0);
+  }
+});
+
+test('unresolved overlap decisions block all writes and journal creation', async () => {
+  const mock = makeApi();
+  const entries = [entry(bookmark('WouldCreate')), entry(reviewedBookmark('unresolved', 'Incoming'))];
+  await assert.rejects(runImport(mock.api, await mock.preview(entries, reviewOptions({}))), /resolv|decision|review/i);
+  assert.equal(mock.calls.creates.length, 0);
+  assert.equal(mock.calls.updates.length, 0);
+  assert.equal(mock.calls.storageWrites, 0);
+  assert.deepEqual(await getHistory(mock.api), []);
+});
+
+test('stale reviewed replacement snapshots fail before mutation when target is renamed, moved, or removed', async () => {
+  for (const change of ['rename', 'move', 'remove']) {
+    const mock = makeApi();
+    const payload = await mock.preview([entry(reviewedBookmark('stale', 'Incoming'))], reviewOptions({ 'id:stale': { choice: 'replace', targetId: '10' } }));
+    if (change === 'rename') mock.userEdit('10', { title: 'External edit' });
+    else if (change === 'move') mock.userMove('10', '2');
+    else await mock.api.bookmarks.remove('10');
+    await assert.rejects(runImport(mock.api, payload), /changed after the preview|resolv|review/i);
+    assert.equal(mock.calls.updates.length, 0);
+    assert.equal(mock.calls.creates.length, 0);
+    assert.equal(mock.calls.storageWrites, 0);
+  }
+});
+
+test('update undo preserves bookmarks edited or moved by the user after import', async () => {
+  for (const change of ['title', 'url', 'parent']) {
+    const mock = makeApi();
+    const job = await runImport(mock.api, await mock.preview([entry(reviewedBookmark('change', 'Imported title'))], reviewOptions({ 'id:change': { choice: 'replace', targetId: '10' } })));
+    if (change === 'title') mock.userEdit('10', { title: 'User title' });
+    else if (change === 'url') mock.userEdit('10', { url: 'https://user-changed.example/' });
+    else mock.userMove('10', '2');
+    const beforeUndo = clone(mock.nodes.get('10'));
+    const callsBefore = mock.calls.updates.length;
+    const undone = await undoImport(mock.api, job.id);
+    assert.equal(undone.status, 'undo-partial');
+    assert.equal(undone.updated.length, 1);
+    assert.equal(undone.preserved, 1);
+    assert.deepEqual(mock.nodes.get('10'), beforeUndo);
+    assert.equal(mock.calls.updates.length, callsBefore);
+    assert.equal(mock.calls.removes.length, 0);
+  }
+});
+
+test('a transient read failure retains an update undo record for a successful retry', async () => {
+  const mock = makeApi();
+  const job = await runImport(mock.api, await mock.preview([entry(reviewedBookmark('retry', 'Imported title'))], reviewOptions({ 'id:retry': { choice: 'replace', targetId: '10' } })));
+  const get = mock.api.bookmarks.get;
+  mock.api.bookmarks.get = async () => { throw new Error('Transient bookmark read failure'); };
+  const callsBefore = mock.calls.updates.length;
+  const partial = await undoImport(mock.api, job.id);
+  assert.equal(partial.status, 'undo-partial');
+  assert.equal(partial.updated.length, 1);
+  assert.equal(mock.calls.updates.length, callsBefore);
+  mock.api.bookmarks.get = get;
+  assert.equal((await undoImport(mock.api, job.id)).status, 'undone');
+  assert.equal(mock.nodes.get('10').title, 'Existing');
+});
+
+test('sequential updates to one ID use canonical browser return values and restore the original state once', async () => {
+  const mock = makeApi({ canonicalizeUpdates: true });
+  const entries = [entry(reviewedBookmark('first', 'First', 'HTTPS://EXISTING.EXAMPLE:443/')), entry(reviewedBookmark('second', 'Second'))];
+  const options = reviewOptions({ 'id:first': { choice: 'replace', targetId: '10' }, 'id:second': { choice: 'merge', targetId: '10' } });
+  const job = await runImport(mock.api, await mock.preview(entries, options));
+  assert.equal(job.updated.length, 2);
+  assert.equal(mock.nodes.get('10').title, 'First · Second');
+  assert.equal(mock.nodes.get('10').url, 'https://existing.example/');
+  assert.deepEqual(job.updated[1].before, job.updated[0].after);
+  const undone = await undoImport(mock.api, job.id);
+  assert.equal(undone.status, 'undone');
+  assert.equal(undone.restored, 1);
+  assert.deepEqual(mock.calls.updates.map(call => call.changes.title), ['First', 'First · Second', 'Existing']);
+  assert.equal(mock.nodes.get('10').title, 'Existing');
+  assert.equal(mock.calls.removes.length, 0);
+});
+
+test('a user edit matching an intermediate update state is preserved instead of mistaken for the final imported state', async () => {
+  const mock = makeApi();
+  const entries = [entry(reviewedBookmark('first', 'First')), entry(reviewedBookmark('second', 'Second'))];
+  const options = reviewOptions({ 'id:first': { choice: 'replace', targetId: '10' }, 'id:second': { choice: 'merge', targetId: '10' } });
+  const job = await runImport(mock.api, await mock.preview(entries, options));
+  mock.userEdit('10', { title: 'First' });
+  const partial = await undoImport(mock.api, job.id);
+  assert.equal(partial.status, 'undo-partial');
+  assert.equal(partial.preserved, 1);
+  assert.ok(partial.updated.length > 0);
+  assert.equal(mock.nodes.get('10').title, 'First');
+  assert.equal(mock.calls.updates.length, 2);
+  // Returning to the final imported state permits a safe retry of the group.
+  mock.userEdit('10', { title: 'First · Second' });
+  const retried = await undoImport(mock.api, job.id);
+  assert.equal(retried.status, 'undone');
+  assert.equal(retried.restored, 1);
+  assert.equal(mock.nodes.get('10').title, 'Existing');
+});
+
+test('a target edited between two writes stops the import and keeps the successful first update undoable', async () => {
+  const mock = makeApi();
+  const entries = [entry(reviewedBookmark('first', 'First update')), entry(reviewedBookmark('second', 'Second update', 'https://docs.example/'))];
+  const options = reviewOptions({ 'id:first': { choice: 'replace', targetId: '10' }, 'id:second': { choice: 'replace', targetId: '12' } });
+  const payload = await mock.preview(entries, options);
+  const update = mock.api.bookmarks.update;
+  mock.api.bookmarks.update = async (id, changes) => {
+    const result = await update(id, changes);
+    if (id === '10') mock.userEdit('12', { title: 'User changed while importing' });
+    return result;
+  };
+  await assert.rejects(runImport(mock.api, payload), /changed|stale|match|review/i);
+  const [job] = await getHistory(mock.api);
+  assert.equal(job.status, 'partial');
+  assert.equal(job.updated.length, 1);
+  assert.deepEqual(mock.calls.updates.map(call => call.id), ['10']);
+  assert.equal(mock.nodes.get('12').title, 'User changed while importing');
+  mock.api.bookmarks.update = update;
+  await undoImport(mock.api, job.id);
+  assert.equal(mock.nodes.get('10').title, 'Existing');
+  assert.equal(mock.nodes.get('12').title, 'User changed while importing');
+});
+
+test('a confirmed update survives a post-write journal error and can be undone safely', async () => {
+  const mock = makeApi();
+  const payload = await mock.preview([entry(reviewedBookmark('journal', 'Changed'))], reviewOptions({ 'id:journal': { choice: 'replace', targetId: '10' } }));
+  const set = mock.api.storage.local.set;
+  let failed = false;
+  mock.api.storage.local.set = async values => {
+    if (mock.calls.updates.length && !failed) { failed = true; throw new Error('Simulated post-update journal failure'); }
+    return set(values);
+  };
+  await assert.rejects(runImport(mock.api, payload), /journal failure/);
+  assert.equal(failed, true);
+  assert.equal(mock.nodes.get('10').title, 'Changed');
+  const [job] = await getHistory(mock.api);
+  assert.equal(job.status, 'partial');
+  assert.equal(job.updated.length, 1);
+  assert.equal((await undoImport(mock.api, job.id)).status, 'undone');
+  assert.equal(mock.nodes.get('10').title, 'Existing');
+});
+
+test('legacy version-one chunk journals still load and undo their confirmed creations', async () => {
+  const mock = makeApi();
+  const created = mock.userCreate({ parentId: '1', title: 'Legacy created item', url: 'https://legacy.example/' });
+  const record = { id: created.id, parentId: created.parentId, title: created.title, url: created.url };
+  await mock.api.storage.local.set({
+    importHistory: [{ id: 'legacy-v1', status: 'complete', journalVersion: 1, createdCount: 1, createdChunkCount: 1, pending: null }],
+    'importJournal:legacy-v1:0': [record],
+  });
+  const [loaded] = await getHistory(mock.api);
+  assert.deepEqual(loaded.created, [record]);
+  assert.deepEqual(loaded.updated, []);
+  assert.equal((await undoImport(mock.api, loaded.id)).status, 'undone');
+  assert.equal(mock.nodes.has(created.id), false);
+  assert.equal(mock.nodes.get('10').title, 'Existing');
+  assert.equal(mock.calls.updates.length, 0);
+});
+
+test('missing update journal chunks block undo without overwriting the updated bookmark', async () => {
+  const mock = makeApi();
+  const job = await runImport(mock.api, await mock.preview([entry(reviewedBookmark('missing', 'Updated'))], reviewOptions({ 'id:missing': { choice: 'replace', targetId: '10' } })));
+  const key = Object.keys(mock.storageData).find(key => key.startsWith(`importUpdates:${job.id}:`));
+  assert.ok(key);
+  delete mock.storageData[key];
+  const callsBefore = mock.calls.updates.length;
+  await assert.rejects(undoImport(mock.api, job.id), /journal is incomplete/);
+  assert.equal(mock.calls.updates.length, callsBefore);
+  assert.equal(mock.nodes.get('10').title, 'Updated');
+});
+
+test('worker-crash recovery restores a known pending update only when its current state still matches', async () => {
+  for (const outcome of ['applied', 'externally-edited', 'already-reverted']) {
+    const mock = makeApi({ canonicalizeUpdates: true });
+    const payload = await mock.preview([entry(reviewedBookmark('crash', 'Crash update', 'HTTPS://EXISTING.EXAMPLE:443/'))], reviewOptions({ 'id:crash': { choice: 'replace', targetId: '10' } }));
+    const update = mock.api.bookmarks.update;
+    let lastPersistedBeforeWrite;
+    mock.api.bookmarks.update = async (id, changes) => {
+      lastPersistedBeforeWrite = clone(mock.storageData);
+      return update(id, changes);
+    };
+    const job = await runImport(mock.api, payload);
+    mock.api.bookmarks.update = update;
+    assert.ok(lastPersistedBeforeWrite.importHistory[0].pending, 'pending intent must be durable before update');
+    // Emulate termination after the browser write but before persisting its reply.
+    for (const key of Object.keys(mock.storageData)) delete mock.storageData[key];
+    Object.assign(mock.storageData, lastPersistedBeforeWrite);
+    if (outcome === 'externally-edited') mock.userEdit('10', { title: 'User changed after the crash' });
+    else if (outcome === 'already-reverted') mock.userEdit('10', { title: 'Existing', url: 'https://existing.example/' });
+    const result = await undoImport(mock.api, job.id);
+    assert.equal(mock.nodes.has('10'), true);
+    assert.equal(mock.calls.removes.length, 0);
+    if (outcome === 'externally-edited') {
+      assert.equal(result.status, 'undo-partial');
+      assert.equal(result.updated.length, 1);
+      assert.equal(mock.nodes.get('10').title, 'User changed after the crash');
+      assert.equal(mock.calls.updates.length, 1);
+    } else {
+      assert.equal(result.status, 'undone');
+      assert.equal(result.updated.length, 0);
+      assert.equal(mock.nodes.get('10').title, 'Existing');
+      assert.equal(mock.calls.updates.length, outcome === 'applied' ? 2 : 1);
+      assert.equal(result.restored || 0, outcome === 'applied' ? 1 : 0);
+    }
+  }
+});
+
+test('update-only quota failures reject before any changes or undo-journal writes', async () => {
+  const mock = makeApi({ storageOverhead: 9 * 1024 * 1024 });
+  const payload = await mock.preview([entry(reviewedBookmark('quota', 'Updated'))], reviewOptions({ 'id:quota': { choice: 'replace', targetId: '10' } }));
+  await assert.rejects(runImport(mock.api, payload), /not enough local storage/);
+  assert.equal(mock.calls.updates.length, 0);
+  assert.equal(mock.calls.creates.length, 0);
+  assert.equal(mock.calls.storageWrites, 0);
+  assert.equal(mock.nodes.get('10').title, 'Existing');
+});
+
+test('large update journals use bounded chunks, hydrate fully, and restore every unique bookmark', async () => {
+  const mock = makeApi();
+  const duplicateDecisions = {};
+  const entries = Array.from({ length: JOURNAL_CHUNK_SIZE + 5 }, (_, index) => {
+    const local = mock.userCreate({ parentId: '1', title: `Original ${index}`, url: `https://updates.example/${index}` });
+    duplicateDecisions[`id:incoming-${index}`] = { choice: 'replace', targetId: local.id };
+    return entry(reviewedBookmark(`incoming-${index}`, `Updated ${index}`, local.url));
+  });
+  const before = await mock.api.bookmarks.getTree();
+  const job = await runImport(mock.api, await mock.preview(entries, reviewOptions(duplicateDecisions)));
+  assert.equal(mock.storageData.importHistory[0].updatedCount, entries.length);
+  assert.equal(mock.storageData.importHistory[0].updatedChunkCount, 2);
+  assert.equal(mock.calls.maxUpdateChunk, JOURNAL_CHUNK_SIZE);
+  assert.ok(mock.calls.updateRecordsWritten < entries.length * JOURNAL_CHUNK_SIZE);
+  assert.deepEqual((await getHistory(mock.api))[0], job);
+  const undone = await undoImport(mock.api, job.id);
+  assert.equal(undone.status, 'undone');
+  assert.equal(undone.restored, entries.length);
+  assert.deepEqual(await mock.api.bookmarks.getTree(), before);
+  assert.equal(Object.keys(mock.storageData).some(key => key.startsWith(`importUpdates:${job.id}:`)), false);
 });

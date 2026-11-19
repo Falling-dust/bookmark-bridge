@@ -2,6 +2,7 @@ import { parseBookmarkText, serializeHTML, serializeJSON } from './lib/formats.j
 import { buildImportPlan } from './lib/planner.js';
 import { getHistory, runImport, undoImport } from './lib/operations.js';
 import { createDemoApi } from './lib/demo.js';
+import { duplicateReviewMarkup } from './lib/duplicate-review.js';
 
 const demo = !globalThis.chrome?.bookmarks;
 const api = demo ? createDemoApi() : chrome;
@@ -15,6 +16,8 @@ function units(node) { return node.url !== undefined || !node.children?.length ?
 function prune(nodes, selection) { return nodes.flatMap(node => { if (node.url !== undefined || !node.children?.length) return selection.has(node.id) ? [structuredClone(node)] : []; const children = prune(node.children, selection); return children.length ? [{ ...node, children }] : []; }); }
 function flatBookmarks(nodes) { const result = []; walk(nodes, node => { if (node.url !== undefined) result.push(node); }); return result; }
 const exportOrders = new Map();
+let duplicateDecisions = Object.create(null);
+let reviewPage = 0;
 state.destinations = Object.create(null);
 function exportNodes() {
   let nodes = prune(state.roots, state.chosen);
@@ -66,7 +69,7 @@ function treeMarkup(nodes, { source = 'export', depth = 0, reorder = false, chec
 }
 function updateMixed() { document.querySelectorAll('[data-mixed]').forEach(input => input.indeterminate = true); }
 function render() {
-  const titles = { export: ['A little order. A fresh start.', 'Bring the bookmarks you love. Leave the clutter behind.'], import: ['Make room for what’s next.', 'Place incoming bookmarks exactly where they belong.'], history: ['Every transfer, accounted for.', 'Review imports and undo the items they created.'] };
+  const titles = { export: ['A little order. A fresh start.', 'Bring the bookmarks you love. Leave the clutter behind.'], import: ['Make room for what’s next.', 'Place incoming bookmarks exactly where they belong.'], history: ['Every transfer, accounted for.', 'Review imports and undo bookmark changes.'] };
   $('#view-title').textContent = titles[state.view][0]; $('#view-subtitle').textContent = titles[state.view][1];
   document.querySelectorAll('[data-view]').forEach(button => { button.classList.toggle('active', button.dataset.view === state.view); if (button.dataset.view === state.view) button.setAttribute('aria-current', 'page'); else button.removeAttribute('aria-current'); });
   if (state.view === 'export') renderExport(); else if (state.view === 'import') renderImport(); else renderHistory().catch(error => toast(error.message, true));
@@ -95,7 +98,11 @@ function renderImport() {
     ${selected.length ? `<div class="panel-header placement-heading"><div><h3 class="panel-title">Choose a home</h3><p class="panel-subtitle">Each selected top-level item can go to a different folder. Nested folders keep their structure.</p></div></div><div class="placement-list">${selected.map((node, index) => `<div class="placement-item"><div class="placement-title"><span class="tree-icon">${icon(node.url !== undefined ? 'bookmark' : 'folder')}</span><strong>${esc(node.title || 'Untitled')}</strong><span class="row-actions"><button class="icon-button" data-action="reorder" data-source="import" data-id="${esc(node.id)}" data-direction="-1" aria-label="Move ${esc(node.title)} up" ${index === 0 ? 'disabled' : ''}>↑</button><button class="icon-button" data-action="reorder" data-source="import" data-id="${esc(node.id)}" data-direction="1" aria-label="Move ${esc(node.title)} down" ${index === selected.length - 1 ? 'disabled' : ''}>↓</button></span></div><label class="sr-only" for="dest-${esc(node.id)}">Destination for ${esc(node.title)}</label><select class="select destination-select" id="dest-${esc(node.id)}" data-destination="${esc(node.id)}">${folderOptions(state.destinations[node.id] || state.defaultDestination)}</select></div>`).join('')}</div>` : ''}</section>
     <aside class="panel import-settings"><div class="panel-header"><div><h3 class="panel-title">Import preferences</h3><p class="panel-subtitle">You decide how it all fits together</p></div></div><div class="panel-body">
     <div class="field"><label class="field-label" for="default-destination">Default destination</label><select class="select" id="default-destination">${folderOptions(state.defaultDestination)}</select><p class="field-hint">Applies to items without an individual destination.</p></div>
-    <div class="field"><label class="field-label" for="duplicate-policy">When a URL already exists</label><select class="select" id="duplicate-policy"><option value="skip" ${state.duplicatePolicy === 'skip' ? 'selected' : ''}>Skip the incoming duplicate</option><option value="keep" ${state.duplicatePolicy === 'keep' ? 'selected' : ''}>Keep both bookmarks</option></select></div>
+    <div class="field"><label class="field-label" for="duplicate-policy">When a URL already exists</label><select class="select" id="duplicate-policy">
+      <option value="skip" ${state.duplicatePolicy === 'skip' ? 'selected' : ''}>Skip the incoming duplicate</option>
+      <option value="keep" ${state.duplicatePolicy === 'keep' ? 'selected' : ''}>Keep both bookmarks</option>
+      <option value="review" ${state.duplicatePolicy === 'review' ? 'selected' : ''}>Review each match</option>
+    </select>${state.duplicatePolicy === 'review' ? '<p class="field-hint">Compare matching bookmarks in the preview and choose an action for each one.</p>' : ''}</div>
     <div class="field"><label class="field-label" for="duplicate-scope">Look for duplicates</label><select class="select" id="duplicate-scope" ${state.duplicatePolicy === 'keep' ? 'disabled' : ''}><option value="destination" ${state.duplicateScope === 'destination' ? 'selected' : ''}>In each destination folder</option><option value="global" ${state.duplicateScope === 'global' ? 'selected' : ''}>Across the whole browser</option></select><p class="field-hint">Different query strings, fragments, and trailing slashes stay distinct.</p></div>
     <label class="check-field"><input type="checkbox" id="merge-folders" ${state.mergeFolders ? 'checked' : ''}> Merge folders with identical names</label><p class="field-hint">Combines contents recursively within the chosen destination.</p>
     <div class="field"><label class="field-label" for="insert-position">Place new items</label><select class="select" id="insert-position"><option value="end" ${state.position === 'end' ? 'selected' : ''}>At the end of each folder</option><option value="start" ${state.position === 'start' ? 'selected' : ''}>At the beginning of each folder</option></select></div><button class="button primary full-width" id="preview-button" ${!selected.length || !getFolders().length ? 'disabled' : ''}>Review import &nbsp; →</button><p class="footer-note center">Preview first. Import when you’re ready.</p></div></aside></div><div id="import-preview">${state.plan ? previewMarkup() : ''}</div>`}`;
@@ -103,15 +110,32 @@ function renderImport() {
 }
 function previewMarkup() {
   const { stats, actions } = state.plan;
-  const labels = { 'create-folder': 'New folder', 'create-bookmark': 'New bookmark', 'merge-folder': 'Merge folder', skip: 'Skip duplicate' };
-  const paths = new Map(getFolders().map(folder => [folder.id, folder.label]));
+  const labels = {
+    'create-folder': 'New folder', 'create-bookmark': 'New bookmark', 'merge-folder': 'Merge folder',
+    'update-bookmark': 'Update bookmark', unchanged: 'Already matches', unresolved: 'Choose an action', skip: 'Skip duplicate',
+  };
+  const paths = new Map();
+  walk(state.tree, (node, parent) => {
+    if (node.url !== undefined) return;
+    const parentPath = paths.get(parent?.id);
+    paths.set(node.id, [parentPath, node.title].filter(Boolean).join(' / '));
+  });
   const previewPaths = actions.map(action => { const parentPath = paths.get(action.parentRef) || action.parentRef; if (action.type === 'create-folder') paths.set(action.key, `${parentPath} / ${action.title}`); return parentPath; });
-  return `<section class="panel preview-panel"><div class="panel-header"><div><span class="eyebrow">READY WHEN YOU ARE</span><h3 class="panel-title">Here’s what will happen</h3><p class="panel-subtitle">No existing bookmarks will be deleted or moved.</p></div><button class="button secondary small" id="download-plan">Save review</button></div><div class="stats-grid">${[[stats.bookmarks, 'New bookmarks'], [stats.folders, 'New folders'], [stats.merged, 'Folders merged'], [stats.skipped, 'Duplicates skipped']].map(([value, label]) => `<div class="stat-card"><span class="stat-value">${value}</span><span class="stat-label">${label}</span></div>`).join('')}</div>
-    <div class="preview-list">${actions.slice(0, 300).map((action, index) => `<div class="preview-row"><span class="badge ${action.type === 'skip' ? '' : 'accent'}">${labels[action.type]}</span><div><strong>${esc(action.title || 'Untitled')}</strong><p class="muted">${esc(previewPaths[index])}${action.reason ? ` · ${esc(action.reason)}` : ''}</p></div></div>`).join('') || '<div class="empty-state">There are no changes to apply.</div>'}</div>${actions.length > 300 ? `<p class="footer-note panel-body">Showing the first 300 of ${actions.length} actions. Save review to inspect the complete plan.</p>` : ''}<div class="panel-footer preview-footer"><p class="footer-note">You can undo created items from History.</p><button class="button primary" id="apply-import" ${!stats.bookmarks && !stats.folders ? 'disabled' : ''}>Import ${stats.bookmarks} bookmarks &nbsp; →</button></div></section>`;
+  const totals = [[stats.bookmarks, 'New bookmarks'], [stats.folders, 'New folders'], [stats.merged, 'Folders merged'], [stats.skipped, 'Duplicates skipped']];
+  if (state.duplicatePolicy === 'review') totals.push([stats.updated || 0, 'Bookmark updates']);
+  const hasWrites = stats.bookmarks || stats.folders || stats.updated;
+  const needsChoice = actions.some(action => action.type === 'unresolved');
+  const review = duplicateReviewMarkup({ plan: state.plan, decisions: duplicateDecisions, page: reviewPage, paths, escape: esc });
+  const applyHint = needsChoice ? 'Choose an action for each match to continue.'
+    : hasWrites ? 'You can undo these changes from History.' : 'All entries are skipped or already match. There are no changes to apply.';
+  return `<section class="panel preview-panel"><div class="panel-header"><div><h3 class="panel-title">Import preview</h3></div><button class="button secondary small" id="download-plan">Save review</button></div>
+    ${review}<div class="stats-grid">${totals.map(([value, label]) => `<div class="stat-card"><span class="stat-value">${value}</span><span class="stat-label">${label}</span></div>`).join('')}</div>
+    <div class="preview-list">${actions.slice(0, 300).map((action, index) => `<div class="preview-row"><span class="badge ${action.type === 'skip' ? '' : 'accent'}">${labels[action.type]}</span><div><strong>${esc(action.title || 'Untitled')}</strong><p class="muted">${esc(previewPaths[index])}${action.reason ? ` · ${esc(action.reason)}` : ''}</p></div></div>`).join('') || '<div class="empty-state">There are no changes to apply.</div>'}</div>${actions.length > 300 ? `<p class="footer-note panel-body">Showing the first 300 of ${actions.length} actions. Save review to inspect the complete plan.</p>` : ''}
+    <div class="panel-footer preview-footer"><p class="footer-note">${applyHint}</p><button class="button primary" id="apply-import" ${!hasWrites || needsChoice ? 'disabled' : ''}>Apply import</button></div></section>`;
 }
 async function renderHistory() {
   const history = await getHistory(api); if (state.view !== 'history') return;
-  $('#workspace').innerHTML = `<div class="workspace-intro"><div><span class="eyebrow">YOUR TRANSFER JOURNAL</span><h2>A clear trail. An easy way back.</h2><p class="muted">Import history is stored on this computer.</p></div></div><section class="panel"><div class="panel-header"><div><h3 class="panel-title">Import history</h3><p class="panel-subtitle">Undo removes unchanged items created by that import. Edited items and folders with added contents are preserved.</p></div></div><div class="history-list">${history.length ? history.map(job => `<article class="history-item"><span class="tree-icon">${icon()}</span><div class="history-details"><strong>${esc(job.filename)}</strong><p class="muted">${new Date(job.startedAt).toLocaleString()} · ${job.stats.bookmarks} bookmarks · ${job.stats.folders} folders</p><span class="badge">${esc(job.status.replaceAll('-', ' '))}</span>${job.error ? `<p class="error-text">${esc(job.error)}</p>` : ''}${job.preserved ? `<p class="muted">${job.preserved} edited or nonempty items preserved.</p>` : ''}${job.recoveryWarning ? `<p class="muted">${esc(job.recoveryWarning)}</p>` : ''}</div>${!['undone', 'failed-empty'].includes(job.status) ? `<button class="button secondary small" data-undo="${esc(job.id)}">${job.status === 'undo-partial' ? 'Retry undo' : 'Undo import'}</button>` : '<span class="muted">No action needed</span>'}</article>`).join('') : '<div class="empty-state"><span class="empty-icon">↶</span><h3>A fresh page</h3><p>Your imports will appear here, with a way to undo each one.</p><button class="button secondary" data-view="import">Import bookmarks</button></div>'}</div></section><div class="notice"><div><strong>A small precaution for a big collection</strong><p>For a full backup, select all bookmarks in Export and save an HTML or JSON copy before importing.</p></div></div>`;
+  $('#workspace').innerHTML = `<div class="workspace-intro"><div><span class="eyebrow">YOUR TRANSFER JOURNAL</span><h2>A clear trail. An easy way back.</h2><p class="muted">Import history is stored on this computer.</p></div></div><section class="panel"><div class="panel-header"><div><h3 class="panel-title">Import history</h3><p class="panel-subtitle">Undo restores replaced or merged bookmarks and removes items added by the import. Bookmarks you edited or moved afterward are preserved.</p></div></div><div class="history-list">${history.length ? history.map(job => `<article class="history-item"><span class="tree-icon">${icon()}</span><div class="history-details"><strong>${esc(job.filename)}</strong><p class="muted">${new Date(job.startedAt).toLocaleString()} · ${job.stats.bookmarks} bookmarks · ${job.stats.folders} folders · ${job.stats.updated || 0} updates</p><span class="badge">${esc(job.status.replaceAll('-', ' '))}</span>${job.error ? `<p class="error-text">${esc(job.error)}</p>` : ''}${job.preserved ? `<p class="muted">${job.preserved} changed or unavailable items preserved.</p>` : ''}${job.recoveryWarning ? `<p class="muted">${esc(job.recoveryWarning)}</p>` : ''}</div>${!['undone', 'failed-empty'].includes(job.status) ? `<button class="button secondary small" data-undo="${esc(job.id)}">${job.status === 'undo-partial' ? 'Retry undo' : 'Undo import'}</button>` : '<span class="muted">No action needed</span>'}</article>`).join('') : '<div class="empty-state"><span class="empty-icon">↶</span><h3>A fresh page</h3><p>Your imports will appear here, with a way to undo each one.</p><button class="button secondary" data-view="import">Import bookmarks</button></div>'}</div></section><div class="notice"><div><strong>A small precaution for a big collection</strong><p>For a full backup, select all bookmarks in Export and save an HTML or JSON copy before importing.</p></div></div>`;
 }
 async function readFile(file) {
   if (!file) return;
@@ -122,8 +146,35 @@ async function readFile(file) {
   walk(parsed.nodes, (node, parent, depth) => { if (node.children && depth < 1) state.importExpanded.add(node.id); });
   state.destinations = Object.create(null); state.plan = null; render(); toast(`Loaded ${count(parsed.nodes).bookmarks} bookmarks. Choose their destinations, then review.`);
 }
-function importPayload() { return { entries: prune(state.importNodes, state.importChosen).map(node => ({ node, destinationId: state.destinations[node.id] || state.defaultDestination })), options: { duplicatePolicy: state.duplicatePolicy, duplicateScope: state.duplicateScope, mergeFolders: state.mergeFolders, position: state.position }, filename: state.filename }; }
-async function previewImport() { state.plan = null; state.tree = await api.bookmarks.getTree(); const payload = importPayload(); try { state.plan = buildImportPlan({ ...payload.options, entries: payload.entries, existingTree: state.tree }); } catch (error) { renderImport(); throw error; } renderImport(); $('#import-preview').scrollIntoView({ behavior: 'smooth', block: 'start' }); }
+function importPayload() {
+  const entries = prune(state.importNodes, state.importChosen).map(node => ({
+    node, destinationId: state.destinations[node.id] || state.defaultDestination,
+  }));
+  const options = { duplicatePolicy: state.duplicatePolicy, duplicateScope: state.duplicateScope, mergeFolders: state.mergeFolders, position: state.position };
+  if (state.duplicatePolicy === 'review') options.duplicateDecisions = duplicateDecisions;
+  return { entries, options, filename: state.filename };
+}
+function rebuildPlan() {
+  const { entries, options } = importPayload();
+  state.plan = null;
+  state.plan = buildImportPlan({ ...options, entries, existingTree: state.tree });
+}
+async function previewImport() {
+  state.plan = null;
+  duplicateDecisions = Object.create(null);
+  reviewPage = 0;
+  state.tree = await api.bookmarks.getTree();
+  try { rebuildPlan(); } finally { renderImport(); }
+  $('#import-preview').scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+function redrawReview(focusControl, id) {
+  const preview = $('#import-preview');
+  try { rebuildPlan(); } finally { preview.innerHTML = state.plan ? previewMarkup() : ''; }
+  if (focusControl) {
+    const selector = focusControl === 'choice' ? 'data-conflict-choice' : 'data-conflict-target';
+    preview.querySelector(`[${selector}="${CSS.escape(id)}"]`)?.focus({ preventScroll: true });
+  }
+}
 async function execute(type, payload) {
   if (demo) return type === 'import' ? runImport(api, payload) : undoImport(api, payload);
   const response = await chrome.runtime.sendMessage(type === 'import' ? { type, payload } : { type, id: payload });
@@ -131,10 +182,10 @@ async function execute(type, payload) {
   return response.result;
 }
 async function applyImport() {
-  if (!state.plan || state.busy) return;
+  if (!state.plan || state.busy || state.plan.actions.some(action => action.type === 'unresolved')) return;
   const payload = { ...importPayload(), expectedActions: JSON.stringify(state.plan.actions) };
   setBusy(true);
-  try { const result = await execute('import', payload); await loadTree(); state.view = 'history'; render(); toast(`Import complete: ${result.stats.bookmarks} bookmarks added, ${result.stats.skipped} duplicates skipped.`); }
+  try { const result = await execute('import', payload); await loadTree(); state.view = 'history'; render(); toast(`Import complete. ${result.stats.bookmarks} bookmarks added, ${result.stats.updated || 0} updated, ${result.stats.skipped} skipped.`); }
   catch (error) { state.plan = null; toast(error.message, true); render(); }
   finally { setBusy(false); }
 }
@@ -155,7 +206,7 @@ function reorderNode(source, id, direction) {
 }
 function help() {
   const dialog = document.createElement('dialog'); dialog.className = 'help-dialog';
-  dialog.innerHTML = `<span class="eyebrow">A QUICK FIELD GUIDE</span><h2>One collection. Anywhere you go.</h2><ol class="help-steps"><li><strong>Choose & arrange.</strong><p>Select bookmarks or entire folders in Export. Use the arrow controls to arrange the exported order. Your browser’s existing order stays unchanged.</p></li><li><strong>Take your file with you.</strong><p>Save as HTML for universal browser import, or JSON for a Bookmark Bridge backup. Transfer the file to your other computer.</p></li><li><strong>Give it a home.</strong><p>Open Import on the other computer, choose the file, and select a destination for each top-level item. Review duplicates and folder merges before importing.</p></li></ol><p class="muted">Everything is processed locally. No accounts, uploads, analytics, or access to the pages you visit. Export files contain your bookmark titles and URLs.</p><p class="muted">HTML and JSON support folders and URLs. Browser-specific tags, favicons, and bookmark keywords are not transferred. Undo is available for imports made by this extension.</p><div class="dialog-actions"><button class="button primary" id="close-help">Got it</button></div>`;
+  dialog.innerHTML = `<span class="eyebrow">A QUICK FIELD GUIDE</span><h2>One collection. Anywhere you go.</h2><ol class="help-steps"><li><strong>Choose & arrange.</strong><p>Select bookmarks or entire folders in Export. Use the arrow controls to arrange the exported order. Your browser’s existing order stays unchanged.</p></li><li><strong>Take your file with you.</strong><p>Save as HTML for universal browser import, or JSON for a Bookmark Bridge backup. Transfer the file to your other computer.</p></li><li><strong>Give it a home.</strong><p>Open Import on the other computer, choose the file, and select a destination for each top-level item. Choose Review each match to skip, keep both, replace details, or merge titles before importing.</p></li></ol><p class="muted">Everything is processed locally. No accounts, uploads, analytics, or access to the pages you visit. Export files contain your bookmark titles and URLs.</p><p class="muted">HTML and JSON support folders and URLs. Browser-specific tags, favicons, and bookmark keywords are not transferred. Undo is available for imports made by this extension.</p><div class="dialog-actions"><button class="button primary" id="close-help">Got it</button></div>`;
   document.body.append(dialog); dialog.showModal(); dialog.querySelector('#close-help').onclick = () => dialog.close(); dialog.addEventListener('close', () => dialog.remove());
 }
 
@@ -180,18 +231,44 @@ document.addEventListener('click', async event => {
     if (target.id === 'export-button') { const nodes = exportNodes(); const filename = `bookmark-bridge-${new Date().toISOString().slice(0, 10)}.${state.format}`; download(state.format === 'html' ? serializeHTML(nodes) : serializeJSON(nodes), filename, state.format === 'html' ? 'text/html;charset=utf-8' : 'application/json'); toast('Your export is ready. Check your browser’s downloads.'); }
     if (target.id === 'drop-zone' || target.id === 'replace-file') $('#import-file').click();
     if (target.id === 'preview-button') await previewImport();
+    if (target.hasAttribute('data-review-page')) {
+      reviewPage = Number(target.dataset.reviewPage);
+      $('#import-preview').innerHTML = previewMarkup();
+      $('#import-preview select[data-conflict-choice]')?.focus();
+    }
+    if (target.id === 'skip-remaining') {
+      for (const action of state.plan.actions) if (action.type === 'unresolved') duplicateDecisions[action.conflictKey] = { choice: 'skip' };
+      redrawReview();
+    }
     if (target.id === 'apply-import') await applyImport();
     if (target.id === 'download-plan') download(JSON.stringify({ filename: state.filename, ...state.plan }, null, 2), 'bookmark-bridge-import-review.json', 'application/json');
     if (target.id === 'refresh-button') { await loadTree(true); render(); toast('Library refreshed. Export ordering and import preview were reset.'); }
     if (target.id === 'help-button') help();
     if (target.dataset.undo) {
-      const dialog = document.createElement('dialog'); dialog.className = 'help-dialog'; dialog.innerHTML = '<h2>Undo this import?</h2><p>This removes unchanged bookmarks and empty folders created by this import. Edited or moved items, and folders with other contents, are preserved.</p><div class="dialog-actions"><button class="button secondary" data-cancel>Keep import</button><button class="button danger" data-confirm>Undo import</button></div>'; document.body.append(dialog); dialog.showModal(); dialog.querySelector('[data-cancel]').onclick = () => dialog.close(); dialog.addEventListener('close', () => dialog.remove()); dialog.querySelector('[data-confirm]').onclick = async () => { dialog.close(); setBusy(true); try { const result = await execute('undo', target.dataset.undo); await loadTree(); render(); toast(`Undo complete. ${result.removed} items removed${result.preserved ? `; ${result.preserved} changed or nonempty items preserved` : ''}.`); } catch (error) { toast(error.message, true); } finally { setBusy(false); } };
+      const dialog = document.createElement('dialog'); dialog.className = 'help-dialog'; dialog.innerHTML = '<h2>Undo this import?</h2><p>Undo restores the previous titles and URLs of updated bookmarks and removes items added by this import. Bookmarks you edited or moved afterward are preserved.</p><div class="dialog-actions"><button class="button secondary" data-cancel>Keep import</button><button class="button danger" data-confirm>Undo import</button></div>'; document.body.append(dialog); dialog.showModal(); dialog.querySelector('[data-cancel]').onclick = () => dialog.close(); dialog.addEventListener('close', () => dialog.remove()); dialog.querySelector('[data-confirm]').onclick = async () => { dialog.close(); setBusy(true); try { const result = await execute('undo', target.dataset.undo); await loadTree(); render(); toast(`Undo complete. ${result.restored || 0} bookmarks restored, ${result.removed} items removed${result.preserved ? `; ${result.preserved} changed or nonempty items preserved` : ''}.`); } catch (error) { toast(error.message, true); } finally { setBusy(false); } };
     }
   } catch (error) { toast(error.message, true); }
 });
 document.addEventListener('change', async event => {
   const target = event.target; if (state.busy) return;
   try {
+    if (target.hasAttribute('data-conflict-choice')) {
+      const key = target.dataset.conflictChoice;
+      duplicateDecisions[key] = { choice: target.value || null, targetId: target.dataset.currentTarget || null };
+      redrawReview('choice', key);
+      return;
+    }
+    if (target.hasAttribute('data-conflict-target')) {
+      const key = target.dataset.conflictTarget;
+      const conflict = state.plan.conflicts.find(item => item.key === key);
+      const match = conflict?.matches.find(item => item.id === target.value);
+      if (!match) return;
+      const previous = conflict.choice;
+      const choice = match.locked && ['merge', 'replace'].includes(previous) ? null : previous;
+      duplicateDecisions[key] = { choice, targetId: match.id };
+      redrawReview('target', key);
+      return;
+    }
     if (target.dataset.action === 'select-node') { const source = target.dataset.source; const node = findNode(source === 'import' ? state.importNodes : state.roots, target.dataset.id); const selection = source === 'import' ? state.importChosen : state.chosen; for (const id of units(node)) target.checked ? selection.add(id) : selection.delete(id); state.plan = null; render(); return; }
     const fields = { 'preserve-folders': ['preserveFolders', true], 'include-roots': ['includeRoots', true], 'export-format': ['format'], 'default-destination': ['defaultDestination'], 'duplicate-policy': ['duplicatePolicy'], 'duplicate-scope': ['duplicateScope'], 'merge-folders': ['mergeFolders', true], 'insert-position': ['position'] };
     if (fields[target.id]) { const [key, boolean] = fields[target.id]; state[key] = boolean ? target.checked : target.value; state.plan = null; render(); }
