@@ -1,122 +1,70 @@
 # Bookmark Bridge
 
-A browser extension for transferring selected bookmarks between Chrome and Edge. Choose bookmarks and folders, arrange the exported order, then review where incoming items will go and how duplicates will be handled.
+Select bookmarks from Chrome or Edge, arrange them in an export file, and place them into folders on another computer. Bookmark Bridge runs locally with the browser’s `bookmarks` and `storage` permissions.
 
-[Download the latest extension ZIP](https://github.com/Falling-dust/bookmark-bridge/releases/latest) · [Browse releases](https://github.com/Falling-dust/bookmark-bridge/releases)
+[Download the latest release](https://github.com/Falling-dust/bookmark-bridge/releases/latest) · [Install or update](docs/INSTALL.md)
 
-![Bookmark Bridge export interface with sample bookmarks](docs/preview.png)
-
-## Install in Chrome or Edge
-
-1. Keep the `bookmark-bridge` folder somewhere on your computer. If you received a ZIP, extract it first.
-2. Open `chrome://extensions` in Chrome or `edge://extensions` in Edge.
-3. Turn on **Developer mode**, choose **Load unpacked**, and select the folder containing `manifest.json`.
-4. Open the browser's Extensions menu and click **Bookmark Bridge**. Pin it to the toolbar if desired.
-5. Install the same folder on your other computer to use the import workflow there.
-
-Use a current Chrome or Edge release; the extension declares Chrome 109 as its minimum version. This is an unpacked extension, not a Chrome Web Store or Edge Add-ons listing. No build or dependency installation is needed to load it.
+![Exporting selected folders from the sample bookmark library](docs/preview.png)
 
 ## Transfer bookmarks
 
-**Export**
+1. On the first computer, open **Export bookmarks**. Search for sites or select whole folders. Use the arrows in **Your export** to arrange items. Keep the folder structure, include browser root folders, or export a flat list.
+2. Save as **HTML** for standard browser import or **JSON** for a Bookmark Bridge backup. Copy the file to the other computer. It contains the selected titles and URLs.
+3. On the other computer, open **Import bookmarks** and choose or drop the file. Select the items to import and choose a destination for each top-level item. **Use folder contents** removes one selected folder layer, so you can place its children separately. Reload the file to recover the original structure.
+4. Set duplicate and folder preferences, choose insertion at the beginning or end of each folder, and select **Review import**. **Save review** downloads the full action list. Select **Apply import** to write the changes. If the library changes enough to affect the plan, the extension asks for a fresh review.
 
-1. Select individual bookmarks or folders. Selecting a folder includes its descendants; you can deselect individual items afterward. Search helps locate items in the library.
-2. Use the arrow controls in **Your export** to arrange the exported order. This changes the export only; your browser's existing bookmark order stays intact.
-3. Keep folder structure, optionally include browser root folders such as **Bookmarks bar**, or turn off folder structure for one flat list.
-4. Export as **HTML** for standard browser import, or **JSON** for a Bookmark Bridge backup. Copy the downloaded file to the other computer using your preferred transfer method.
+Try the same sample transfer in [HTML](examples/transfer-sample.html) or [JSON](examples/transfer-sample.json). It includes nested folders, an empty folder, and a URL bookmarked in two places.
 
-**Import**
+## Resolve overlaps
 
-1. Open **Import** and choose or drop an HTML or JSON bookmark file.
-2. Select the incoming bookmarks and folders to include. Each selected top-level item can have its own destination folder; nested items retain their folder structure. To remove a wrapper such as **Bookmarks bar**, click **Use folder contents**. This promotes the selected top-level folders' contents by one level and preserves their destination settings. Repeat for deeper folders, or reload the file to restore its original structure.
-3. Choose whether duplicate URLs are skipped, kept, or handled individually with **Review each match**. Set duplicate detection to each destination folder or the whole browser, and choose whether identically named folders should be merged.
-4. Place new items at the beginning or end of their destination folders, then click **Review import**. If reviewing matches, compare the incoming and local titles and URLs, select the intended local bookmark when several match, and resolve every match before applying the import. **Save review** downloads the complete action list.
-5. Click **Apply import** when the preview is ready. Open **History** to review the import or undo its additions and updates.
+By default, Bookmark Bridge skips duplicate URLs in each destination folder and merges folders whose names match exactly, including case. Preferences also let you search the whole browser for duplicates, keep every copy, or **Review each match**.
 
-If the bookmark library changes after the preview in a way that changes the plan, the import stops and asks for a fresh preview. Existing bookmarks are updated only when you choose **Replace** or **Merge** for a reviewed match. These actions preserve the selected bookmark's ID and folder; imports do not delete or move existing bookmarks. Managed folders cannot be used as destinations.
-
-Try [examples/transfer-sample.html](examples/transfer-sample.html) or [examples/transfer-sample.json](examples/transfer-sample.json) in the local demo before using your own data. The examples include nested folders, an empty folder, a repeated URL, and URLs with distinct query strings or fragments.
-
-## Duplicate and folder behavior
-
-- Duplicate matching compares URLs. Scheme and hostname case and default network ports are normalized. Paths, query strings, query order, fragments, and trailing slashes remain significant; `/guide` and `/guide/` are separate bookmarks. A host with no path is equivalent to that host's `/` URL.
-- With **In each destination folder**, a URL is checked against the immediate destination folder. When folders merge, the same rule applies within each merged folder. **Across the whole browser** checks every existing bookmark and earlier items in the incoming plan.
-- Folder merging uses exact, case-sensitive folder names within the chosen destination. Repeated incoming folders with the same name can also merge. Turn merging off to create separate folders.
-- Empty folders are supported. Browser-specific root wrappers are initially preserved when importing standard exports. **Use folder contents** lets you place the contents directly into existing browser folders. You can also omit root wrappers when exporting.
-
-**Review each match** is optional. The default remains **Skip the incoming duplicate**; **Keep both bookmarks** applies to all matches when individual review is unnecessary. In review mode, each matching URL has these choices:
-
-| Choice | Result |
+| Choice | What happens |
 | --- | --- |
-| **Skip** | Leave the local bookmark unchanged and omit the incoming duplicate. |
-| **Keep both** | Leave the local bookmark unchanged and add the incoming bookmark to its chosen destination. |
-| **Replace** | Update the selected local bookmark with the incoming title and URL, retaining its ID and folder. |
-| **Merge** | Join distinct local and incoming titles with ` · `, retaining the local bookmark's stored URL, ID, and folder. Identical titles are not repeated. |
+| **Skip** | Omit the incoming bookmark. |
+| **Keep both** | Add the incoming bookmark to its chosen destination. |
+| **Replace** | Give the selected local bookmark the incoming title and URL. Its ID and folder stay the same. |
+| **Merge** | Join distinct title components with ` · ` and keep the local URL, ID, and folder. |
 
-For example, matching titles **Research notes** and **Reference library** can become **Research notes · Reference library**. A merge combines bookmark names; it does not combine the contents of the web pages.
+When several local bookmarks match, select the copy you want to update. A browser-wide match may be outside the incoming destination. Read-only bookmarks and duplicates found only within the incoming file support **Skip** and **Keep both**. Managed folders cannot be import destinations.
 
-When several local bookmarks match a URL, choose the exact target in the match's selector. With **Across the whole browser**, that target may be in another folder; replacing or merging updates it where it already lives. The incoming destination applies to newly created bookmarks. Duplicates that exist only earlier in the same imported file, and matches in managed or otherwise read-only locations, offer **Skip** and **Keep both** only. A file containing only updates can still be applied; an unresolved match or a plan containing only skipped items cannot be committed.
+URL comparison normalizes scheme and hostname case and default ports. Paths, query order, fragments, and trailing slashes are significant. A host with an empty path matches its `/` URL.
 
-## Undo and interrupted imports
+## Undo an import
 
-Undo removes newly created bookmarks only when their saved IDs, parent folders, titles, and URLs still match the import record. For **Replace** and **Merge**, it restores the previous title and URL only when the bookmark still matches the recorded imported result. Later user edits or moves are preserved. Folders created by the import are removed only when empty; folders containing other content are preserved. Existing folders that received merged content are never removed.
+Open **Import history** in the browser profile where the import ran. Undo removes unchanged additions, removes newly created folders once empty, and restores the previous details of unchanged replacements and merges. Bookmarks edited or moved afterward and folders with additional contents are preserved.
 
-History is stored in this extension's local browser storage. Undo requires that history and applies to imports made in that browser profile. If an import is interrupted, open History to review or undo the recorded changes before importing again. If creation completed but its returned ID was not saved, the uncertain item is left untouched and a recovery warning requests manual review. Clearing extension data or uninstalling it removes its history.
+If a transfer was interrupted, check its history entry before retrying. When the browser created an item but its ID was never recorded, the extension leaves it in place for manual review. Updating the extension in the same folder retains local history. Clearing extension data or uninstalling deletes it.
 
-## Privacy, formats, and limits
+## Formats and limits
 
-The extension requests only `bookmarks` and `storage` permissions. Bookmark parsing, previews, exports, and history run locally. It makes no application network requests, loads no site favicons, and does not access the contents of visited pages. Your browser's own bookmark sync settings continue to apply. Export files contain bookmark titles and URLs, so share those files accordingly.
+- Imports accept Netscape bookmark HTML, Bookmark Bridge JSON version 1, Chrome bookmark tree arrays, and Chromium’s on-disk `Bookmarks` JSON.
+- Files can contain up to 100,000 entries and 100 nested levels, with a 20 MB size limit. Each import allows up to 5,000 creations and updates combined, subject to space for undo history.
+- The preview displays 20 duplicate matches per page and up to 300 action rows. The downloaded review contains every action.
+- Supported URL schemes are `http`, `https`, `ftp`, `file`, `mailto`, `chrome`, `edge`, and `about`. Imports flag malformed entries and unsupported URLs. Selecting an unsupported URL for export raises an error.
+- Exports preserve available creation dates at the chosen format’s precision. The browser assigns new dates when importing. Favicons, tags, and other browser-specific metadata are omitted. Browser sync follows your profile settings.
 
-Supported input:
+## Development
 
-- Netscape bookmark HTML exported by Chrome, Edge, Firefox, and other compatible browsers.
-- Bookmark Bridge JSON (`format: "bookmark-bridge"`, `version: 1`, `children: [...]`).
-- Chrome-style `bookmarks.getTree()` JSON arrays and Chromium's on-disk `Bookmarks` JSON with `roots`.
-
-Files are limited to 20 MB, 100,000 entries, and 100 nested levels. The interface shows the first 300 preview actions; **Save review** includes all actions. Malformed entries and unsupported URLs are reported. Allowed URL schemes are `http`, `https`, `ftp`, `file`, `mailto`, `chrome`, `edge`, and `about`; executable bookmarklets and `data:` URLs are excluded. Exports reject unsupported selected URLs rather than silently dropping them.
-
-Each import can perform up to 5,000 bookmark or folder creations and bookmark updates combined. Select smaller batches for larger transfers. Before writing bookmarks, the extension checks that enough local storage remains for its undo journal. Journal records are stored in chunks so large imports do not repeatedly rewrite the entire history.
-
-HTML is parsed as inert text. Tags, favicons, keywords, and other browser-specific metadata are not transferred. Export files preserve available creation dates, but imported items receive browser-assigned creation dates because the browser creation API does not accept historical dates. File URLs and browser-specific internal pages may be useful only on their original computer or browser.
-
-## Development and verification
-
-These commands require a source checkout of this repository; the release ZIP contains only the ready-to-load extension. Use Node.js 20 or later. The extension, unit tests, and local preview need no npm dependencies.
+From a source checkout, use Node.js 20 or later for tests and the local sample-library preview. Packaging requires Python 3.9 or later. These commands use only built-in dependencies.
 
 ```sh
 npm test
 npm run preview
-```
-
-The preview command prints a local URL. In a normal browser tab the UI uses a sample bookmark library and local demo history; it cannot read or change the browser's real bookmarks. Load the extension to exercise real browser permissions and APIs.
-
-Browser integration checks and icon regeneration use optional development tools:
-
-```sh
-npm install --no-save playwright sharp
-npm run test:browser
-node scripts/make-icons.mjs
-```
-
-`npm run test:browser` runs UI and real Manifest V3 integration checks using Playwright and a fresh isolated Edge profile for each run. Checks cover all four overlap decisions, selecting among multiple local matches, destination versus browser-wide matching, update-only imports, and undo that preserves subsequent user edits. Install Edge before running it; `BROWSER_CHANNEL` can override the channel. It does not use your normal browser profile. Screenshots are saved under `test-results/`. `node scripts/make-icons.mjs` regenerates the bundled PNG icons from `icons/mark.svg` using Sharp; the generated icons are already included, so ordinary use does not require this step.
-
-Both tools resolve packages from the local installation by default. To use an existing installation elsewhere, set `PLAYWRIGHT_MODULE` to the path of Playwright's `index.mjs`, or `SHARP_MODULE` to the installed Sharp package directory or its entry file. Explicit overrides take precedence over local packages.
-
-Create the distributable ZIP with Python 3:
-
-```sh
 python scripts/package.py
 ```
 
-Source layout:
+The preview uses sample bookmarks and local demo history. Load the unpacked extension to use your browser’s bookmark library. The packager writes `release/bookmark-bridge-<version>.zip` with the runtime files and installation guide.
 
-- `app.js`: selection, export ordering, placement controls, previews, and history UI.
-- `lib/formats.js`: inert HTML parsing, JSON adapters, validation, and serialization.
-- `lib/planner.js`: deterministic duplicate detection, per-match decisions, and import planning.
-- `lib/duplicate-review.js`: local-versus-incoming comparison and overlap decision controls.
-- `lib/operations.js`: browser writes, persistent creation and update records, and conservative undo.
-- `background.js`: Manifest V3 service worker and serialized mutation requests.
-- `lib/demo.js`: isolated browser API substitute for the local demo.
-- `tests/`: automated parser, planning, and operation tests.
+For browser integration checks, install Playwright and Edge, then run the suite. It uses a disposable browser profile and saves screenshots under `test-results/`.
 
-The main extension uses plain JavaScript ES modules and a Manifest V3 service worker. Runtime assets are bundled with the extension; no remote code is loaded.
+```sh
+npm install --no-save --package-lock=false playwright
+npm run test:browser
+```
+
+Set `EXTENSION_DIR` to the extracted folder containing `manifest.json` to test a release ZIP. The default browser channel is `msedge`. Override it with `BROWSER_CHANNEL` or select an existing Playwright installation using `PLAYWRIGHT_MODULE` (path to `index.mjs`).
+
+The four bundled PNG icon sizes come from `icons/mark.svg`. To regenerate them, install Sharp and run `node scripts/make-icons.mjs`. Set `SHARP_MODULE` to use an existing Sharp installation.
+
+`app.js` handles page state and interaction. `ui/` renders the bookmark trees, import, export, duplicate review, and history views. `lib/` contains format handling, bookmark selection and ordering, import planning, browser operations, the undo journal, and the demo adapter. The Manifest V3 service worker in `background.js` serializes imports and undo requests.

@@ -1,286 +1,358 @@
-import { parseBookmarkText, serializeHTML, serializeJSON } from './lib/formats.js';
+import { MAX_FILE_BYTES, parseBookmarkText, serializeHTML, serializeJSON } from './lib/formats.js';
 import { buildImportPlan } from './lib/planner.js';
 import { getHistory, runImport, undoImport } from './lib/operations.js';
 import { createDemoApi } from './lib/demo.js';
-import { duplicateReviewMarkup } from './lib/duplicate-review.js';
+import {
+  countNodes, exportSelection, findNode, listFolders, moveExportItem, moveImportItem,
+  selectableIds, selectedTree, walk,
+} from './lib/selection.js';
+import { exportMarkup, libraryMarkup } from './ui/export-view.js';
+import { importMarkup, previewMarkup } from './ui/import-view.js';
+import { historyMarkup } from './ui/history-view.js';
+import { updateMixedCheckboxes } from './ui/tree.js';
+import { escapeHtml } from './ui/html.js';
 
 const demo = !globalThis.chrome?.bookmarks;
 const api = demo ? createDemoApi() : chrome;
-const $ = selector => document.querySelector(selector);
-const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-const icon = (kind = 'folder') => kind === 'folder' ? '<svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/></svg>' : '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M8 3h8a1 1 0 0 1 1 1v17l-5-4-5 4V4a1 1 0 0 1 1-1Z"/></svg>';
-const state = { view: 'export', tree: [], roots: [], chosen: new Set(), expanded: new Set(), query: '', preserveFolders: true, includeRoots: false, format: 'html', importNodes: [], importChosen: new Set(), importExpanded: new Set(), filename: '', warnings: [], destinations: {}, defaultDestination: '', duplicatePolicy: 'skip', duplicateScope: 'destination', mergeFolders: true, position: 'end', plan: null, busy: false };
-function walk(nodes, fn, parent = null, depth = 0) { for (const node of nodes) { fn(node, parent, depth); if (node.children) walk(node.children, fn, node, depth + 1); } }
-function count(nodes) { let bookmarks = 0, folders = 0; walk(nodes, node => node.url !== undefined ? bookmarks++ : folders++); return { bookmarks, folders }; }
-function units(node) { return node.url !== undefined || !node.children?.length ? [node.id] : node.children.flatMap(units); }
-function prune(nodes, selection) { return nodes.flatMap(node => { if (node.url !== undefined || !node.children?.length) return selection.has(node.id) ? [structuredClone(node)] : []; const children = prune(node.children, selection); return children.length ? [{ ...node, children }] : []; }); }
-function flatBookmarks(nodes) { const result = []; walk(nodes, node => { if (node.url !== undefined) result.push(node); }); return result; }
-const exportOrders = new Map();
-let duplicateDecisions = Object.create(null);
-let reviewPage = 0;
-state.destinations = Object.create(null);
-function exportNodes() {
-  let nodes = prune(state.roots, state.chosen);
-  if (!state.includeRoots) nodes = nodes.flatMap(node => node.children || [node]);
-  if (!state.preserveFolders) nodes = flatBookmarks(nodes);
-  const arrange = (siblings, key) => {
-    const order = exportOrders.get(key);
-    if (order) { const rank = new Map(order.map((id, index) => [id, index])); siblings.sort((a, b) => (rank.get(a.id) ?? order.length) - (rank.get(b.id) ?? order.length)); }
-    for (const node of siblings) if (node.children) arrange(node.children, node.id);
-    return siblings;
-  };
-  return arrange(nodes, state.preserveFolders ? 'top' : 'flat');
+const byId = id => document.getElementById(id);
+const workspace = byId('workspace');
+const state = {
+  view: 'export', tree: [], roots: [], folders: [], busy: false,
+  chosen: new Set(), expanded: new Set(), orders: new Map(), query: '',
+  preserveFolders: true, includeRoots: false, format: 'html',
+  importNodes: [], importChosen: new Set(), importExpanded: new Set(), filename: '', warnings: [],
+  destinations: Object.create(null), defaultDestination: '', duplicatePolicy: 'skip',
+  duplicateScope: 'destination', mergeFolders: true, position: 'end',
+  plan: null, decisions: Object.create(null), reviewPage: 0,
+};
+
+const pages = {
+  export: ['Export bookmarks', 'Choose bookmarks and set their order in the exported file.'],
+  import: ['Import bookmarks', 'Choose destinations and review changes before importing.'],
+  history: ['Import history', 'Review or undo imports made in this browser profile.'],
+};
+const settings = {
+  'preserve-folders': 'preserveFolders', 'include-roots': 'includeRoots', 'export-format': 'format',
+  'default-destination': 'defaultDestination', 'duplicate-policy': 'duplicatePolicy',
+  'duplicate-scope': 'duplicateScope', 'merge-folders': 'mergeFolders', 'insert-position': 'position',
+};
+
+let toastTimer;
+function notify(message, error = false) {
+  const toast = byId('toast');
+  toast.textContent = message;
+  toast.className = error ? 'visible error' : 'visible';
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => toast.classList.remove('visible'), error ? 12000 : 6500);
 }
-function getFolders() { const folders = []; const visit = (nodes, path = [], blocked = false) => { for (const node of nodes) { const locked = blocked || Boolean(node.unmodifiable) || node.folderType === 'managed'; if (node.url !== undefined) continue; const next = node.title ? [...path, node.title] : path; if (node.id !== '0' && !locked) folders.push({ id: node.id, label: next.join(' / ') || 'Untitled folder' }); visit(node.children || [], next, locked); } }; visit(state.tree); return folders; }
-function folderOptions(value) { const folders = getFolders(); const missing = value && !folders.some(folder => folder.id === value); return (missing ? `<option value="${esc(value)}" selected disabled>Unavailable folder — choose again</option>` : '') + folders.map(folder => `<option value="${esc(folder.id)}"${folder.id === value ? ' selected' : ''}>${esc(folder.label)}</option>`).join(''); }
-function toast(message, error = false) { $('#toast').textContent = message; $('#toast').className = `toast visible${error ? ' error' : ''}`; clearTimeout(toast.timer); toast.timer = setTimeout(() => $('#toast').classList.remove('visible'), error ? 12000 : 6500); }
-function download(text, filename, type) { const url = URL.createObjectURL(new Blob([text], { type })); const a = document.createElement('a'); a.href = url; a.download = filename; a.click(); setTimeout(() => URL.revokeObjectURL(url), 30000); }
-function setBusy(value) { state.busy = value; $('#busy-overlay').hidden = !value; $('#workspace').inert = value; document.querySelectorAll('[data-view], #refresh-button').forEach(button => button.disabled = value); }
-async function loadTree(reset = false) {
-  exportOrders.clear();
-  state.tree = await api.bookmarks.getTree();
-  state.roots = structuredClone(state.tree[0]?.children || []);
-  const ids = new Set(); walk(state.roots, (node, parent, depth) => { ids.add(node.id); if (reset && depth < 2 && node.children) state.expanded.add(node.id); });
+
+function download(contents, filename, type) {
+  const url = URL.createObjectURL(new Blob([contents], { type }));
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 30000);
+}
+
+function setBusy(busy, message) {
+  state.busy = busy;
+  workspace.inert = busy;
+  const overlay = byId('busy-overlay');
+  if (busy) overlay.querySelector('p').textContent = message;
+  overlay.hidden = !busy;
+  for (const button of document.querySelectorAll('nav button, #refresh-button')) button.disabled = busy;
+}
+
+async function whileBusy(message, task) {
+  setBusy(true, message);
+  try { return await task(); } finally { setBusy(false); }
+}
+
+function setLibrary(tree) {
+  state.tree = tree;
+  state.folders = listFolders(tree);
+}
+
+async function loadLibrary(expand = false) {
+  setLibrary(await api.bookmarks.getTree());
+  state.roots = state.tree[0]?.children || [];
+  state.orders.clear();
+  const ids = new Set();
+  walk(state.roots, (node, parent, depth) => {
+    ids.add(node.id);
+    if (expand && depth < 2 && node.children) state.expanded.add(node.id);
+  });
   state.chosen = new Set([...state.chosen].filter(id => ids.has(id)));
-  const folders = getFolders(); if (!folders.some(folder => folder.id === state.defaultDestination)) state.defaultDestination = folders[0]?.id || '';
-  const stats = count(state.roots);
-  $('#library-summary').textContent = `${stats.bookmarks.toLocaleString()} bookmarks · ${stats.folders.toLocaleString()} folders`;
+  const writable = state.folders.filter(folder => !folder.locked);
+  if (!writable.some(folder => folder.id === state.defaultDestination)) {
+    state.defaultDestination = writable[0]?.id || '';
+  }
+  const { bookmarks, folders } = countNodes(state.roots);
+  byId('library-summary').textContent = `${bookmarks.toLocaleString()} bookmarks · ${folders.toLocaleString()} folders`;
   state.plan = null;
 }
-function matches(node, query) { return `${node.title} ${node.url || ''}`.toLowerCase().includes(query) || node.children?.some(child => matches(child, query)); }
-function treeMarkup(nodes, { source = 'export', depth = 0, reorder = false, check = true, query = '' } = {}) {
-  const selection = source === 'import' ? state.importChosen : state.chosen;
-  const expanded = source === 'import' ? state.importExpanded : state.expanded;
-  return nodes.filter(node => !query || matches(node, query)).map((node, index, visible) => {
-    const folder = node.url === undefined;
-    const keys = units(node), checkedCount = keys.filter(id => selection.has(id)).length;
-    const isExpanded = reorder || expanded.has(node.id) || !!query;
-    let domain = ''; if (!folder) { try { domain = new URL(node.url).hostname || new URL(node.url).protocol; } catch { domain = node.url; } }
-    const stats = folder ? count(node.children || []) : null;
-    return `<div class="tree-row${checkedCount ? ' is-selected' : ''}" style="--depth:${depth}" data-node-id="${esc(node.id)}">
-      ${folder && node.children?.length && !reorder ? `<button class="tree-toggle" data-action="expand" data-source="${source}" data-id="${esc(node.id)}" aria-label="${isExpanded ? 'Collapse' : 'Expand'} ${esc(node.title)}" aria-expanded="${isExpanded}">${isExpanded ? '⌄' : '›'}</button>` : '<span class="tree-toggle-spacer"></span>'}
-      ${check ? `<input class="tree-check" type="checkbox" data-action="select-node" data-source="${source}" data-id="${esc(node.id)}" aria-label="Select ${esc(node.title)}" ${checkedCount === keys.length ? 'checked' : ''} ${checkedCount && checkedCount !== keys.length ? 'data-mixed="true"' : ''}>` : ''}
-      <span class="tree-icon${folder ? '' : ' site-icon'}">${folder ? icon() : esc((domain || node.title || '?')[0].toUpperCase())}</span>
-      <span class="tree-content"><span class="tree-title" title="${esc(node.title)}">${esc(node.title || 'Untitled')}</span>${!folder ? `<span class="tree-url" title="${esc(node.url)}">${esc(domain)}</span>` : ''}</span>
-      ${folder ? `<span class="tree-meta">${stats.bookmarks} links</span>` : ''}
-      ${reorder ? `<span class="row-actions"><button class="icon-button" data-action="reorder" data-source="${source}" data-id="${esc(node.id)}" data-direction="-1" aria-label="Move ${esc(node.title)} up" title="Move up" ${index === 0 ? 'disabled' : ''}>↑</button><button class="icon-button" data-action="reorder" data-source="${source}" data-id="${esc(node.id)}" data-direction="1" aria-label="Move ${esc(node.title)} down" title="Move down" ${index === visible.length - 1 ? 'disabled' : ''}>↓</button></span>` : ''}
-      </div>${folder && isExpanded ? treeMarkup(node.children || [], { source, depth: depth + 1, reorder, check, query: query && `${node.title}`.toLowerCase().includes(query) ? '' : query }) : ''}`;
-  }).join('');
+
+let renderRequest = 0;
+async function render() {
+  const request = ++renderRequest;
+  const [title, subtitle] = pages[state.view];
+  byId('view-title').textContent = title;
+  byId('view-subtitle').textContent = subtitle;
+  for (const button of document.querySelectorAll('nav [data-view]')) {
+    if (button.dataset.view === state.view) button.setAttribute('aria-current', 'page');
+    else button.removeAttribute('aria-current');
+  }
+  if (state.view === 'history') {
+    workspace.replaceChildren();
+    const jobs = await getHistory(api);
+    if (request !== renderRequest) return;
+    workspace.innerHTML = historyMarkup(jobs);
+  } else {
+    workspace.innerHTML = state.view === 'import' ? importMarkup(state) : exportMarkup(state);
+    updateMixedCheckboxes(workspace);
+  }
 }
-function updateMixed() { document.querySelectorAll('[data-mixed]').forEach(input => input.indeterminate = true); }
-function render() {
-  const titles = { export: ['A little order. A fresh start.', 'Bring the bookmarks you love. Leave the clutter behind.'], import: ['Make room for what’s next.', 'Place incoming bookmarks exactly where they belong.'], history: ['Every transfer, accounted for.', 'Review imports and undo bookmark changes.'] };
-  $('#view-title').textContent = titles[state.view][0]; $('#view-subtitle').textContent = titles[state.view][1];
-  document.querySelectorAll('[data-view]').forEach(button => { button.classList.toggle('active', button.dataset.view === state.view); if (button.dataset.view === state.view) button.setAttribute('aria-current', 'page'); else button.removeAttribute('aria-current'); });
-  if (state.view === 'export') renderExport(); else if (state.view === 'import') renderImport(); else renderHistory().catch(error => toast(error.message, true));
-  updateMixed();
-}
-function renderExport() {
-  const selected = exportNodes(), stats = count(selected);
-  $('#workspace').innerHTML = `<div class="workspace-intro"><div><span class="eyebrow">CURATE YOUR NEXT CHAPTER</span><h2>Your bookmarks, your way.</h2><p class="muted">Choose a few favorites or a whole folder. The structure travels with you.</p></div><span class="chip">${icon('bookmark')} Local & private</span></div>
-    <div class="split-layout export-layout"><section class="panel library-panel"><div class="panel-header"><div><h3 class="panel-title">Your library</h3><p class="panel-subtitle">Select folders or individual bookmarks</p></div><span class="badge">THIS BROWSER</span></div>
-    <div class="toolbar"><input id="library-search" class="search-input" type="search" placeholder="Search bookmarks and folders…" aria-label="Search bookmarks and folders" value="${esc(state.query)}"><button class="button ghost small" data-action="select-all">Select all</button><button class="button ghost small" data-action="clear-selection">Clear</button></div>
-    <div class="tree library-tree" id="library-tree">${treeMarkup(state.roots, { query: state.query.toLowerCase() }) || '<div class="empty-state">No bookmarks found.</div>'}</div><div class="panel-footer footer-note">${icon()} Folder selections include their nested bookmarks.</div></section>
-    <aside class="panel export-tray"><div class="panel-header"><div><h3 class="panel-title">Your export</h3><p class="panel-subtitle">A collection worth taking with you</p></div><span class="badge accent">${stats.bookmarks} LINKS</span></div>
-    <div class="selection-list" id="export-selection">${selected.length ? treeMarkup(selected, { reorder: true, check: false }) : `<div class="empty-state"><span class="empty-icon">${icon('bookmark')}</span><h3>Start with a favorite</h3><p>Select bookmarks from your library.<br>Your export takes shape here.</p></div>`}</div>
-    <div class="panel-body export-options"><p class="footer-note">Use ↑ and ↓ to set the exported order.</p><label class="check-field"><input type="checkbox" id="preserve-folders" ${state.preserveFolders ? 'checked' : ''}> Keep folder structure</label><label class="check-field"><input type="checkbox" id="include-roots" ${state.includeRoots ? 'checked' : ''} ${!state.preserveFolders ? 'disabled' : ''}> Include “Bookmarks bar” / root folders</label><div class="field"><label class="field-label" for="export-format">File format</label><select class="select" id="export-format"><option value="html" ${state.format === 'html' ? 'selected' : ''}>HTML · works with all major browsers</option><option value="json" ${state.format === 'json' ? 'selected' : ''}>JSON · Bookmark Bridge backup</option></select></div><button class="button primary full-width" id="export-button" ${!selected.length ? 'disabled' : ''}>↓ &nbsp; Export ${stats.bookmarks} bookmark${stats.bookmarks === 1 ? '' : 's'}</button><p class="footer-note center">${stats.folders} folders · Saved directly to your computer</p></div></aside></div>
-    <div class="notice"><span class="notice-symbol">↗</span><div><strong>A familiar home, on any computer.</strong><p>Export here, open Bookmark Bridge on your other computer, and choose Import to give every folder its place.</p></div></div>`;
-}
-function renderImport() {
-  const hasFile = !!state.filename;
-  const selected = prune(state.importNodes, state.importChosen);
-  $('#workspace').innerHTML = `<div class="workspace-intro"><div><span class="eyebrow">A THOUGHTFUL ARRIVAL</span><h2>Bring your collection home.</h2><p class="muted">Review every addition before it reaches your browser.</p></div><span class="chip">${icon()} Existing bookmarks stay in place</span></div>
-    <input type="file" id="import-file" accept=".html,.htm,.json,text/html,application/json" hidden>
-    ${!hasFile ? `<section class="panel"><div class="drop-zone" id="drop-zone" tabindex="0" role="button" aria-label="Choose a bookmark file"><span class="upload-icon">↑</span><h3>Drop your bookmarks here</h3><p>or <span class="text-accent">browse your files</span></p><span class="footer-note">Netscape HTML or JSON · up to 20 MB</span></div><div class="panel-footer"><strong>Coming from another browser?</strong><p class="muted">Export bookmarks as HTML from Chrome, Edge, Firefox, or Safari, then open that file here.</p></div></section>` : `
-    <div class="file-banner"><span class="file-icon">${icon('bookmark')}</span><div><strong>${esc(state.filename)}</strong><p class="muted">${count(state.importNodes).bookmarks} bookmarks · ${count(state.importNodes).folders} folders</p></div><button class="button secondary small" data-action="unwrap-import" title="Remove selected top-level folder wrappers so their contents can have individual destinations" ${selected.some(node => node.children?.length) ? '' : 'disabled'}>Use folder contents</button><button class="button secondary small" id="replace-file">Choose another file</button></div><p class="footer-note">Importing a “Bookmarks bar” wrapper? Use folder contents to place its selected contents individually. Repeat for deeper folders, or reload the file to restore its structure.</p>
-    ${state.warnings.length ? `<div class="notice warning"><div><strong>Some entries need attention</strong><p>${state.warnings.slice(0, 8).map(esc).join('<br>')}${state.warnings.length > 8 ? `<br>…and ${state.warnings.length - 8} more warnings.` : ''}</p></div></div>` : ''}
-    <div class="split-layout import-layout"><section class="panel"><div class="panel-header"><div><h3 class="panel-title">Incoming collection</h3><p class="panel-subtitle">Choose what to bring and arrange its order</p></div><div class="top-actions"><button class="button ghost small" data-action="import-all">All</button><button class="button ghost small" data-action="import-none">None</button></div></div><div class="tree incoming-tree">${treeMarkup(state.importNodes, { source: 'import' }) || '<div class="empty-state">This file contains an empty collection.</div>'}</div>
-    ${selected.length ? `<div class="panel-header placement-heading"><div><h3 class="panel-title">Choose a home</h3><p class="panel-subtitle">Each selected top-level item can go to a different folder. Nested folders keep their structure.</p></div></div><div class="placement-list">${selected.map((node, index) => `<div class="placement-item"><div class="placement-title"><span class="tree-icon">${icon(node.url !== undefined ? 'bookmark' : 'folder')}</span><strong>${esc(node.title || 'Untitled')}</strong><span class="row-actions"><button class="icon-button" data-action="reorder" data-source="import" data-id="${esc(node.id)}" data-direction="-1" aria-label="Move ${esc(node.title)} up" ${index === 0 ? 'disabled' : ''}>↑</button><button class="icon-button" data-action="reorder" data-source="import" data-id="${esc(node.id)}" data-direction="1" aria-label="Move ${esc(node.title)} down" ${index === selected.length - 1 ? 'disabled' : ''}>↓</button></span></div><label class="sr-only" for="dest-${esc(node.id)}">Destination for ${esc(node.title)}</label><select class="select destination-select" id="dest-${esc(node.id)}" data-destination="${esc(node.id)}">${folderOptions(state.destinations[node.id] || state.defaultDestination)}</select></div>`).join('')}</div>` : ''}</section>
-    <aside class="panel import-settings"><div class="panel-header"><div><h3 class="panel-title">Import preferences</h3><p class="panel-subtitle">You decide how it all fits together</p></div></div><div class="panel-body">
-    <div class="field"><label class="field-label" for="default-destination">Default destination</label><select class="select" id="default-destination">${folderOptions(state.defaultDestination)}</select><p class="field-hint">Applies to items without an individual destination.</p></div>
-    <div class="field"><label class="field-label" for="duplicate-policy">When a URL already exists</label><select class="select" id="duplicate-policy">
-      <option value="skip" ${state.duplicatePolicy === 'skip' ? 'selected' : ''}>Skip the incoming duplicate</option>
-      <option value="keep" ${state.duplicatePolicy === 'keep' ? 'selected' : ''}>Keep both bookmarks</option>
-      <option value="review" ${state.duplicatePolicy === 'review' ? 'selected' : ''}>Review each match</option>
-    </select>${state.duplicatePolicy === 'review' ? '<p class="field-hint">Compare matching bookmarks in the preview and choose an action for each one.</p>' : ''}</div>
-    <div class="field"><label class="field-label" for="duplicate-scope">Look for duplicates</label><select class="select" id="duplicate-scope" ${state.duplicatePolicy === 'keep' ? 'disabled' : ''}><option value="destination" ${state.duplicateScope === 'destination' ? 'selected' : ''}>In each destination folder</option><option value="global" ${state.duplicateScope === 'global' ? 'selected' : ''}>Across the whole browser</option></select><p class="field-hint">Different query strings, fragments, and trailing slashes stay distinct.</p></div>
-    <label class="check-field"><input type="checkbox" id="merge-folders" ${state.mergeFolders ? 'checked' : ''}> Merge folders with identical names</label><p class="field-hint">Combines contents recursively within the chosen destination.</p>
-    <div class="field"><label class="field-label" for="insert-position">Place new items</label><select class="select" id="insert-position"><option value="end" ${state.position === 'end' ? 'selected' : ''}>At the end of each folder</option><option value="start" ${state.position === 'start' ? 'selected' : ''}>At the beginning of each folder</option></select></div><button class="button primary full-width" id="preview-button" ${!selected.length || !getFolders().length ? 'disabled' : ''}>Review import &nbsp; →</button><p class="footer-note center">Preview first. Import when you’re ready.</p></div></aside></div><div id="import-preview">${state.plan ? previewMarkup() : ''}</div>`}`;
-  updateMixed();
-}
-function previewMarkup() {
-  const { stats, actions } = state.plan;
-  const labels = {
-    'create-folder': 'New folder', 'create-bookmark': 'New bookmark', 'merge-folder': 'Merge folder',
-    'update-bookmark': 'Update bookmark', unchanged: 'Already matches', unresolved: 'Choose an action', skip: 'Skip duplicate',
-  };
-  const paths = new Map();
-  walk(state.tree, (node, parent) => {
-    if (node.url !== undefined) return;
-    const parentPath = paths.get(parent?.id);
-    paths.set(node.id, [parentPath, node.title].filter(Boolean).join(' / '));
-  });
-  const previewPaths = actions.map(action => { const parentPath = paths.get(action.parentRef) || action.parentRef; if (action.type === 'create-folder') paths.set(action.key, `${parentPath} / ${action.title}`); return parentPath; });
-  const totals = [[stats.bookmarks, 'New bookmarks'], [stats.folders, 'New folders'], [stats.merged, 'Folders merged'], [stats.skipped, 'Duplicates skipped']];
-  if (state.duplicatePolicy === 'review') totals.push([stats.updated || 0, 'Bookmark updates']);
-  const hasWrites = stats.bookmarks || stats.folders || stats.updated;
-  const needsChoice = actions.some(action => action.type === 'unresolved');
-  const review = duplicateReviewMarkup({ plan: state.plan, decisions: duplicateDecisions, page: reviewPage, paths, escape: esc });
-  const applyHint = needsChoice ? 'Choose an action for each match to continue.'
-    : hasWrites ? 'You can undo these changes from History.' : 'All entries are skipped or already match. There are no changes to apply.';
-  return `<section class="panel preview-panel"><div class="panel-header"><div><h3 class="panel-title">Import preview</h3></div><button class="button secondary small" id="download-plan">Save review</button></div>
-    ${review}<div class="stats-grid">${totals.map(([value, label]) => `<div class="stat-card"><span class="stat-value">${value}</span><span class="stat-label">${label}</span></div>`).join('')}</div>
-    <div class="preview-list">${actions.slice(0, 300).map((action, index) => `<div class="preview-row"><span class="badge ${action.type === 'skip' ? '' : 'accent'}">${labels[action.type]}</span><div><strong>${esc(action.title || 'Untitled')}</strong><p class="muted">${esc(previewPaths[index])}${action.reason ? ` · ${esc(action.reason)}` : ''}</p></div></div>`).join('') || '<div class="empty-state">There are no changes to apply.</div>'}</div>${actions.length > 300 ? `<p class="footer-note panel-body">Showing the first 300 of ${actions.length} actions. Save review to inspect the complete plan.</p>` : ''}
-    <div class="panel-footer preview-footer"><p class="footer-note">${applyHint}</p><button class="button primary" id="apply-import" ${!hasWrites || needsChoice ? 'disabled' : ''}>Apply import</button></div></section>`;
-}
-async function renderHistory() {
-  const history = await getHistory(api); if (state.view !== 'history') return;
-  $('#workspace').innerHTML = `<div class="workspace-intro"><div><span class="eyebrow">YOUR TRANSFER JOURNAL</span><h2>A clear trail. An easy way back.</h2><p class="muted">Import history is stored on this computer.</p></div></div><section class="panel"><div class="panel-header"><div><h3 class="panel-title">Import history</h3><p class="panel-subtitle">Undo restores replaced or merged bookmarks and removes items added by the import. Bookmarks you edited or moved afterward are preserved.</p></div></div><div class="history-list">${history.length ? history.map(job => `<article class="history-item"><span class="tree-icon">${icon()}</span><div class="history-details"><strong>${esc(job.filename)}</strong><p class="muted">${new Date(job.startedAt).toLocaleString()} · ${job.stats.bookmarks} bookmarks · ${job.stats.folders} folders · ${job.stats.updated || 0} updates</p><span class="badge">${esc(job.status.replaceAll('-', ' '))}</span>${job.error ? `<p class="error-text">${esc(job.error)}</p>` : ''}${job.preserved ? `<p class="muted">${job.preserved} changed or unavailable items preserved.</p>` : ''}${job.recoveryWarning ? `<p class="muted">${esc(job.recoveryWarning)}</p>` : ''}</div>${!['undone', 'failed-empty'].includes(job.status) ? `<button class="button secondary small" data-undo="${esc(job.id)}">${job.status === 'undo-partial' ? 'Retry undo' : 'Undo import'}</button>` : '<span class="muted">No action needed</span>'}</article>`).join('') : '<div class="empty-state"><span class="empty-icon">↶</span><h3>A fresh page</h3><p>Your imports will appear here, with a way to undo each one.</p><button class="button secondary" data-view="import">Import bookmarks</button></div>'}</div></section><div class="notice"><div><strong>A small precaution for a big collection</strong><p>For a full backup, select all bookmarks in Export and save an HTML or JSON copy before importing.</p></div></div>`;
-}
-async function readFile(file) {
-  if (!file) return;
-  if (file.size > 20 * 1024 * 1024) throw new Error('Choose a bookmark file smaller than 20 MB.');
-  const parsed = parseBookmarkText(await file.text(), file.name);
-  state.importNodes = parsed.nodes; state.filename = file.name; state.warnings = parsed.warnings;
-  state.importChosen = new Set(parsed.nodes.flatMap(units)); state.importExpanded.clear();
-  walk(parsed.nodes, (node, parent, depth) => { if (node.children && depth < 1) state.importExpanded.add(node.id); });
-  state.destinations = Object.create(null); state.plan = null; render(); toast(`Loaded ${count(parsed.nodes).bookmarks} bookmarks. Choose their destinations, then review.`);
-}
+
 function importPayload() {
-  const entries = prune(state.importNodes, state.importChosen).map(node => ({
+  const entries = selectedTree(state.importNodes, state.importChosen).map(node => ({
     node, destinationId: state.destinations[node.id] || state.defaultDestination,
   }));
-  const options = { duplicatePolicy: state.duplicatePolicy, duplicateScope: state.duplicateScope, mergeFolders: state.mergeFolders, position: state.position };
-  if (state.duplicatePolicy === 'review') options.duplicateDecisions = duplicateDecisions;
-  return { entries, options, filename: state.filename };
+  const { duplicatePolicy, duplicateScope, mergeFolders, position, filename } = state;
+  const options = { duplicatePolicy, duplicateScope, mergeFolders, position };
+  if (duplicatePolicy === 'review') options.duplicateDecisions = state.decisions;
+  return { entries, options, filename };
 }
+
 function rebuildPlan() {
   const { entries, options } = importPayload();
   state.plan = null;
   state.plan = buildImportPlan({ ...options, entries, existingTree: state.tree });
 }
+
 async function previewImport() {
   state.plan = null;
-  duplicateDecisions = Object.create(null);
-  reviewPage = 0;
-  state.tree = await api.bookmarks.getTree();
-  try { rebuildPlan(); } finally { renderImport(); }
-  $('#import-preview').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  state.decisions = Object.create(null);
+  state.reviewPage = 0;
+  try {
+    setLibrary(await api.bookmarks.getTree());
+    rebuildPlan();
+  } finally { await render(); }
+  byId('import-preview')?.scrollIntoView({ block: 'start' });
 }
-function redrawReview(focusControl, id) {
-  const preview = $('#import-preview');
-  try { rebuildPlan(); } finally { preview.innerHTML = state.plan ? previewMarkup() : ''; }
-  if (focusControl) {
-    const selector = focusControl === 'choice' ? 'data-conflict-choice' : 'data-conflict-target';
-    preview.querySelector(`[${selector}="${CSS.escape(id)}"]`)?.focus({ preventScroll: true });
-  }
+
+function redrawReview(field, key) {
+  const preview = byId('import-preview');
+  try { rebuildPlan(); } finally { preview.innerHTML = state.plan ? previewMarkup(state) : ''; }
+  if (field) preview.querySelector(`[data-conflict-${field}="${CSS.escape(key)}"]`)?.focus({ preventScroll: true });
 }
+
 async function execute(type, payload) {
   if (demo) return type === 'import' ? runImport(api, payload) : undoImport(api, payload);
-  const response = await chrome.runtime.sendMessage(type === 'import' ? { type, payload } : { type, id: payload });
-  if (!response?.ok) throw new Error(response?.error || 'The operation did not complete. Check History before retrying.');
+  const message = type === 'import' ? { type, payload } : { type, id: payload };
+  const response = await chrome.runtime.sendMessage(message);
+  if (!response?.ok) throw new Error(response?.error || 'Check History before retrying this operation.');
   return response.result;
 }
+
 async function applyImport() {
-  if (!state.plan || state.busy || state.plan.actions.some(action => action.type === 'unresolved')) return;
+  if (!state.plan || state.plan.actions.some(action => action.type === 'unresolved')) return;
   const payload = { ...importPayload(), expectedActions: JSON.stringify(state.plan.actions) };
-  setBusy(true);
-  try { const result = await execute('import', payload); await loadTree(); state.view = 'history'; render(); toast(`Import complete. ${result.stats.bookmarks} bookmarks added, ${result.stats.updated || 0} updated, ${result.stats.skipped} skipped.`); }
-  catch (error) { state.plan = null; toast(error.message, true); render(); }
-  finally { setBusy(false); }
-}
-function findNode(nodes, id) { let found; walk(nodes, node => { if (node.id === id) found = node; }); return found; }
-function reorderNode(source, id, direction) {
-  if (source === 'export') {
-    const arrange = (nodes, key) => {
-      const at = nodes.findIndex(node => node.id === id);
-      if (at >= 0) { const target = at + direction; if (target < 0 || target >= nodes.length) return true; [nodes[at], nodes[target]] = [nodes[target], nodes[at]]; exportOrders.set(key, nodes.map(node => node.id)); return true; }
-      return nodes.some(node => node.children && arrange(node.children, node.id));
-    };
-    arrange(exportNodes(), state.preserveFolders ? 'top' : 'flat'); render(); return;
+  try {
+    const { stats } = await execute('import', payload);
+    await loadLibrary();
+    state.view = 'history';
+    notify(`Import complete. ${stats.bookmarks} bookmarks added, ${stats.updated || 0} updated, ${stats.skipped} skipped.`);
+  } finally {
+    state.plan = null;
+    await render();
   }
-  const roots = source === 'import' ? state.importNodes : state.roots;
-  const chosen = source === 'import' ? state.importChosen : state.chosen;
-  const swap = nodes => { const index = nodes.findIndex(node => node.id === id); if (index >= 0) { const visible = nodes.filter(node => units(node).some(key => chosen.has(key))); const at = visible.findIndex(node => node.id === id); const neighbor = visible[at + direction]; if (!neighbor) return true; const target = nodes.findIndex(node => node.id === neighbor.id); [nodes[index], nodes[target]] = [nodes[target], nodes[index]]; return true; } return nodes.some(node => node.children && swap(node.children)); };
-  swap(roots); state.plan = null; render();
-}
-function help() {
-  const dialog = document.createElement('dialog'); dialog.className = 'help-dialog';
-  dialog.innerHTML = `<span class="eyebrow">A QUICK FIELD GUIDE</span><h2>One collection. Anywhere you go.</h2><ol class="help-steps"><li><strong>Choose & arrange.</strong><p>Select bookmarks or entire folders in Export. Use the arrow controls to arrange the exported order. Your browser’s existing order stays unchanged.</p></li><li><strong>Take your file with you.</strong><p>Save as HTML for universal browser import, or JSON for a Bookmark Bridge backup. Transfer the file to your other computer.</p></li><li><strong>Give it a home.</strong><p>Open Import on the other computer, choose the file, and select a destination for each top-level item. Choose Review each match to skip, keep both, replace details, or merge titles before importing.</p></li></ol><p class="muted">Everything is processed locally. No accounts, uploads, analytics, or access to the pages you visit. Export files contain your bookmark titles and URLs.</p><p class="muted">HTML and JSON support folders and URLs. Browser-specific tags, favicons, and bookmark keywords are not transferred. Undo is available for imports made by this extension.</p><div class="dialog-actions"><button class="button primary" id="close-help">Got it</button></div>`;
-  document.body.append(dialog); dialog.showModal(); dialog.querySelector('#close-help').onclick = () => dialog.close(); dialog.addEventListener('close', () => dialog.remove());
 }
 
-document.addEventListener('click', async event => {
-  const target = event.target.closest('button, [data-action], #drop-zone'); if (!target || state.busy) return;
-  try {
-    if (target.dataset.view) { state.view = target.dataset.view; render(); return; }
-    const action = target.dataset.action, source = target.dataset.source;
-    if (action === 'expand') { const expanded = source === 'import' ? state.importExpanded : state.expanded; expanded.has(target.dataset.id) ? expanded.delete(target.dataset.id) : expanded.add(target.dataset.id); render(); }
-    if (action === 'select-all') { state.chosen = new Set(state.roots.flatMap(units)); render(); }
-    if (action === 'clear-selection') { state.chosen.clear(); exportOrders.clear(); render(); }
-    if (action === 'import-all' || action === 'import-none') { state.importChosen = new Set(action === 'import-all' ? state.importNodes.flatMap(units) : []); state.plan = null; render(); }
-    if (action === 'unwrap-import') {
-      state.importNodes = state.importNodes.flatMap(node => {
-        if (!node.children?.length || !units(node).some(id => state.importChosen.has(id))) return [node];
-        if (state.destinations[node.id]) for (const child of node.children) state.destinations[child.id] = state.destinations[node.id];
-        delete state.destinations[node.id]; return node.children;
-      });
-      state.plan = null; render(); toast('Selected folder wrappers removed from the preview. Their contents can now be placed individually.');
-    }
-    if (action === 'reorder') reorderNode(source, target.dataset.id, Number(target.dataset.direction));
-    if (target.id === 'export-button') { const nodes = exportNodes(); const filename = `bookmark-bridge-${new Date().toISOString().slice(0, 10)}.${state.format}`; download(state.format === 'html' ? serializeHTML(nodes) : serializeJSON(nodes), filename, state.format === 'html' ? 'text/html;charset=utf-8' : 'application/json'); toast('Your export is ready. Check your browser’s downloads.'); }
-    if (target.id === 'drop-zone' || target.id === 'replace-file') $('#import-file').click();
-    if (target.id === 'preview-button') await previewImport();
-    if (target.hasAttribute('data-review-page')) {
-      reviewPage = Number(target.dataset.reviewPage);
-      $('#import-preview').innerHTML = previewMarkup();
-      $('#import-preview select[data-conflict-choice]')?.focus();
-    }
-    if (target.id === 'skip-remaining') {
-      for (const action of state.plan.actions) if (action.type === 'unresolved') duplicateDecisions[action.conflictKey] = { choice: 'skip' };
-      redrawReview();
-    }
-    if (target.id === 'apply-import') await applyImport();
-    if (target.id === 'download-plan') download(JSON.stringify({ filename: state.filename, ...state.plan }, null, 2), 'bookmark-bridge-import-review.json', 'application/json');
-    if (target.id === 'refresh-button') { await loadTree(true); render(); toast('Library refreshed. Export ordering and import preview were reset.'); }
-    if (target.id === 'help-button') help();
-    if (target.dataset.undo) {
-      const dialog = document.createElement('dialog'); dialog.className = 'help-dialog'; dialog.innerHTML = '<h2>Undo this import?</h2><p>Undo restores the previous titles and URLs of updated bookmarks and removes items added by this import. Bookmarks you edited or moved afterward are preserved.</p><div class="dialog-actions"><button class="button secondary" data-cancel>Keep import</button><button class="button danger" data-confirm>Undo import</button></div>'; document.body.append(dialog); dialog.showModal(); dialog.querySelector('[data-cancel]').onclick = () => dialog.close(); dialog.addEventListener('close', () => dialog.remove()); dialog.querySelector('[data-confirm]').onclick = async () => { dialog.close(); setBusy(true); try { const result = await execute('undo', target.dataset.undo); await loadTree(); render(); toast(`Undo complete. ${result.restored || 0} bookmarks restored, ${result.removed} items removed${result.preserved ? `; ${result.preserved} changed or nonempty items preserved` : ''}.`); } catch (error) { toast(error.message, true); } finally { setBusy(false); } };
-    }
-  } catch (error) { toast(error.message, true); }
-});
-document.addEventListener('change', async event => {
-  const target = event.target; if (state.busy) return;
-  try {
-    if (target.hasAttribute('data-conflict-choice')) {
-      const key = target.dataset.conflictChoice;
-      duplicateDecisions[key] = { choice: target.value || null, targetId: target.dataset.currentTarget || null };
-      redrawReview('choice', key);
-      return;
-    }
-    if (target.hasAttribute('data-conflict-target')) {
-      const key = target.dataset.conflictTarget;
-      const conflict = state.plan.conflicts.find(item => item.key === key);
-      const match = conflict?.matches.find(item => item.id === target.value);
-      if (!match) return;
-      const previous = conflict.choice;
-      const choice = match.locked && ['merge', 'replace'].includes(previous) ? null : previous;
-      duplicateDecisions[key] = { choice, targetId: match.id };
-      redrawReview('target', key);
-      return;
-    }
-    if (target.dataset.action === 'select-node') { const source = target.dataset.source; const node = findNode(source === 'import' ? state.importNodes : state.roots, target.dataset.id); const selection = source === 'import' ? state.importChosen : state.chosen; for (const id of units(node)) target.checked ? selection.add(id) : selection.delete(id); state.plan = null; render(); return; }
-    const fields = { 'preserve-folders': ['preserveFolders', true], 'include-roots': ['includeRoots', true], 'export-format': ['format'], 'default-destination': ['defaultDestination'], 'duplicate-policy': ['duplicatePolicy'], 'duplicate-scope': ['duplicateScope'], 'merge-folders': ['mergeFolders', true], 'insert-position': ['position'] };
-    if (fields[target.id]) { const [key, boolean] = fields[target.id]; state[key] = boolean ? target.checked : target.value; state.plan = null; render(); }
-    if (target.dataset.destination) { state.destinations[target.dataset.destination] = target.value; state.plan = null; render(); }
-    if (target.id === 'import-file') await readFile(target.files[0]);
-  } catch (error) { toast(error.message, true); }
-});
-document.addEventListener('input', event => { if (event.target.id === 'library-search') { state.query = event.target.value; $('#library-tree').innerHTML = treeMarkup(state.roots, { query: state.query.toLowerCase() }) || '<div class="empty-state">No matches. Try a different title or URL.</div>'; updateMixed(); } });
-document.addEventListener('keydown', event => { if (event.target.id === 'drop-zone' && ['Enter', ' '].includes(event.key)) { event.preventDefault(); $('#import-file').click(); } });
-document.addEventListener('dragover', event => { if (state.view === 'import' && !state.busy) { event.preventDefault(); $('#drop-zone')?.classList.add('drag-over'); } });
-document.addEventListener('dragleave', event => { if (event.target.id === 'drop-zone') event.target.classList.remove('drag-over'); });
-document.addEventListener('drop', async event => { if (state.view !== 'import' || state.busy) return; event.preventDefault(); try { await readFile(event.dataTransfer.files[0]); } catch (error) { toast(error.message, true); } });
+async function undo(id) {
+  const result = await execute('undo', id);
+  await loadLibrary();
+  await render();
+  const preserved = result.preserved ? `, ${result.preserved} preserved` : '';
+  notify(`Undo complete. ${result.restored || 0} restored, ${result.removed} removed${preserved}.`);
+}
 
-if (demo) { $('#demo-badge').hidden = false; $('#demo-badge').textContent = 'DEMO · SAMPLE BOOKMARKS'; }
-try { await loadTree(true); render(); } catch (error) { $('#workspace').innerHTML = `<div class="notice warning"><div><strong>Couldn’t read your bookmarks</strong><p>${esc(error.message)}</p><p>Load this folder as an unpacked extension, then click its toolbar icon.</p></div></div>`; }
+async function readFile(file) {
+  if (!file) return;
+  if (file.size > MAX_FILE_BYTES) throw new Error('Choose a bookmark file of 20 MB or less.');
+  const { nodes, warnings } = parseBookmarkText(await file.text(), file.name);
+  state.filename = file.name;
+  state.importNodes = nodes;
+  state.importChosen = new Set(nodes.flatMap(selectableIds));
+  state.importExpanded = new Set(nodes.filter(node => node.children).map(node => node.id));
+  state.warnings = warnings;
+  state.destinations = Object.create(null);
+  state.plan = null;
+  await render();
+}
+
+function unwrapSelection() {
+  state.importNodes = state.importNodes.flatMap(node => {
+    if (!node.children?.length || !selectableIds(node).some(id => state.importChosen.has(id))) return [node];
+    const destination = state.destinations[node.id];
+    if (destination) for (const child of node.children) state.destinations[child.id] = destination;
+    delete state.destinations[node.id];
+    return node.children;
+  });
+  notify('Selected folders’ contents can now be placed individually.');
+}
+
+function handleTreeAction({ action, id, source, direction }) {
+  const importing = source === 'import';
+  switch (action) {
+    case 'expand': {
+      const expanded = importing ? state.importExpanded : state.expanded;
+      if (expanded.has(id)) expanded.delete(id);
+      else expanded.add(id);
+      break;
+    }
+    case 'reorder':
+      if (importing) moveImportItem(state.importNodes, state.importChosen, id, Number(direction));
+      else moveExportItem(state, id, Number(direction));
+      break;
+    case 'select-all': state.chosen = new Set(state.roots.flatMap(selectableIds)); break;
+    case 'clear-selection': state.chosen.clear(); state.orders.clear(); break;
+    case 'import-all': state.importChosen = new Set(state.importNodes.flatMap(selectableIds)); break;
+    case 'import-none': state.importChosen.clear(); break;
+    case 'unwrap-import': unwrapSelection(); break;
+    default: return false;
+  }
+  if (action !== 'expand' && (importing || action.startsWith('import-') || action === 'unwrap-import')) state.plan = null;
+  return true;
+}
+
+async function handleClick(target) {
+  const data = target.dataset;
+  if (data.view) {
+    state.view = data.view;
+    return render();
+  }
+  if (data.undo) {
+    const dialog = byId('undo-dialog');
+    dialog.dataset.jobId = data.undo;
+    dialog.returnValue = 'cancel';
+    dialog.showModal();
+    return;
+  }
+  if (data.reviewPage !== undefined) {
+    state.reviewPage = Number(data.reviewPage);
+    byId('import-preview').innerHTML = previewMarkup(state);
+    byId('import-preview').querySelector('[data-conflict-choice]')?.focus();
+    return;
+  }
+  if (data.action && handleTreeAction(data)) return render();
+  switch (target.id) {
+    case 'preview-button': return whileBusy('Preparing the import preview…', previewImport);
+    case 'apply-import': return whileBusy('Importing bookmarks…', applyImport);
+    case 'help-button': return byId('help-dialog').showModal();
+    case 'drop-zone':
+    case 'replace-file': return byId('import-file').click();
+    case 'export-button': {
+      const nodes = exportSelection(state);
+      const html = state.format === 'html';
+      download(html ? serializeHTML(nodes) : serializeJSON(nodes),
+        `bookmark-bridge-${new Date().toISOString().slice(0, 10)}.${state.format}`,
+        html ? 'text/html;charset=utf-8' : 'application/json');
+      notify('Export ready. Check your browser’s downloads.');
+      break;
+    }
+    case 'skip-remaining':
+      for (const item of state.plan.actions) {
+        if (item.type === 'unresolved') state.decisions[item.conflictKey] = { choice: 'skip' };
+      }
+      return redrawReview();
+    case 'download-plan':
+      return download(JSON.stringify({ filename: state.filename, ...state.plan }, null, 2),
+        'bookmark-bridge-import-review.json', 'application/json');
+    case 'refresh-button': return whileBusy('Reading bookmarks…', async () => {
+      await loadLibrary(true);
+      await render();
+      notify('Library refreshed. Export ordering and import preview were reset.');
+    });
+  }
+}
+
+async function handleChange(target) {
+  const { conflictChoice, conflictTarget, currentTarget, destination, action, id, source } = target.dataset;
+  if (conflictChoice !== undefined) {
+    state.decisions[conflictChoice] = { choice: target.value || null, targetId: currentTarget || null };
+    return redrawReview('choice', conflictChoice);
+  }
+  if (conflictTarget !== undefined) {
+    const conflict = state.plan.conflicts.find(item => item.key === conflictTarget);
+    const match = conflict?.matches.find(item => item.id === target.value);
+    if (!match) return;
+    const choice = match.locked && ['merge', 'replace'].includes(conflict.choice) ? null : conflict.choice;
+    state.decisions[conflictTarget] = { choice, targetId: match.id };
+    return redrawReview('target', conflictTarget);
+  }
+  if (target.id === 'import-file') return whileBusy('Reading bookmark file…', () => readFile(target.files[0]));
+  if (action === 'select-node') {
+    const importing = source === 'import';
+    const node = findNode(importing ? state.importNodes : state.roots, id);
+    if (!node) return;
+    const selection = importing ? state.importChosen : state.chosen;
+    for (const key of selectableIds(node)) {
+      if (target.checked) selection.add(key);
+      else selection.delete(key);
+    }
+  } else if (destination !== undefined) {
+    state.destinations[destination] = target.value;
+  } else if (Object.hasOwn(settings, target.id)) {
+    state[settings[target.id]] = target.type === 'checkbox' ? target.checked : target.value;
+  } else return;
+  if (state.view === 'import') state.plan = null;
+  await render();
+}
+
+function reportError(error) { notify(error.message, true); }
+document.addEventListener('click', event => {
+  const button = event.target.closest('button');
+  if (button && !state.busy) handleClick(button).catch(reportError);
+});
+document.addEventListener('change', event => {
+  if (!state.busy) handleChange(event.target).catch(reportError);
+});
+document.addEventListener('input', event => {
+  if (event.target.id !== 'library-search') return;
+  state.query = event.target.value;
+  byId('library-tree').innerHTML = libraryMarkup(state);
+  updateMixedCheckboxes(byId('library-tree'));
+});
+byId('undo-dialog').addEventListener('close', event => {
+  const dialog = event.target;
+  if (dialog.returnValue === 'undo' && !state.busy) {
+    whileBusy('Undoing import…', () => undo(dialog.dataset.jobId)).catch(reportError);
+  }
+});
+document.addEventListener('dragover', event => {
+  if (state.view !== 'import') return;
+  event.preventDefault();
+  if (state.busy) return;
+  byId('drop-zone')?.classList.add('drag-over');
+});
+document.addEventListener('dragleave', event => {
+  if (event.target.id === 'drop-zone') event.target.classList.remove('drag-over');
+});
+document.addEventListener('drop', event => {
+  if (state.view !== 'import') return;
+  event.preventDefault();
+  if (state.busy) return;
+  byId('drop-zone')?.classList.remove('drag-over');
+  const file = event.dataTransfer.files[0];
+  whileBusy('Reading bookmark file…', () => readFile(file)).catch(reportError);
+});
+
+byId('demo-badge').hidden = !demo;
+try {
+  await loadLibrary(true);
+  await render();
+} catch (error) {
+  workspace.innerHTML = `<div class="notice warning"><div><strong>Couldn’t read bookmarks</strong>
+    <p>${escapeHtml(error.message)}</p></div></div>`;
+}

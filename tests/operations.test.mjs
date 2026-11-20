@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { buildImportPlan } from '../lib/planner.js';
 import { getHistory, runImport, undoImport, JOURNAL_CHUNK_SIZE, MAX_IMPORT_WRITES } from '../lib/operations.js';
+import { createDemoApi } from '../lib/demo.js';
 
 const clone = value => structuredClone(value);
 const bookmark = (title, url = `https://${title.toLowerCase()}.example/`) => ({ title, url });
@@ -688,4 +689,136 @@ test('large update journals use bounded chunks, hydrate fully, and restore every
   assert.equal(undone.restored, entries.length);
   assert.deepEqual(await mock.api.bookmarks.getTree(), before);
   assert.equal(Object.keys(mock.storageData).some(key => key.startsWith(`importUpdates:${job.id}:`)), false);
+});
+
+test('malformed history and ownership records fail before any bookmark mutation', async () => {
+  const damagedHistories = [
+    false,
+    [null],
+    [{ status: 'complete', created: [] }],
+    [{ id: 'duplicate', created: [] }, { id: 'duplicate', created: [] }],
+    [{ id: 'damaged', created: [{ id: '10', title: 'Missing parent' }] }],
+    [{ id: 'damaged', created: [], updated: [{ id: '10', before: {}, after: {} }] }],
+  ];
+  for (const history of damagedHistories) {
+    const mock = makeApi({ history });
+    await assert.rejects(undoImport(mock.api, 'damaged'), /journal.*damaged|history is damaged/i);
+    assert.equal(mock.calls.updates.length, 0);
+    assert.equal(mock.calls.removes.length, 0);
+    assert.equal(mock.calls.storageWrites, 0);
+  }
+});
+
+test('future journal versions are refused without overwriting their data', async () => {
+  const history = [{ id: 'future', journalVersion: 3, status: 'complete', created: [] }];
+  const mock = makeApi({ history });
+  await assert.rejects(getHistory(mock.api), /newer extension version/);
+  assert.deepEqual(mock.storageData.importHistory, history);
+  assert.equal(mock.calls.storageWrites, 0);
+});
+
+function memoryStorage() {
+  const values = new Map();
+  return {
+    get length() { return values.size; },
+    key(index) { return [...values.keys()][index] ?? null; },
+    getItem(key) { return values.get(key) ?? null; },
+    setItem(key, value) { values.set(key, String(value)); },
+    removeItem(key) { values.delete(key); },
+  };
+}
+
+test('the demo adapter reloads chunked imports and safely undoes mixed creations and updates', async () => {
+  const storage = memoryStorage();
+  const api = createDemoApi(storage);
+  const before = await api.bookmarks.getTree();
+  const entries = [
+    entry(folder('Demo import', [bookmark('DemoSite')])),
+    entry(reviewedBookmark('demo-update', 'Revised Figma title', 'https://www.figma.com/')),
+  ];
+  const options = reviewOptions({ 'id:demo-update': { choice: 'replace', targetId: '11' } });
+  const plan = buildImportPlan({ entries, existingTree: before, ...options });
+  const job = await runImport(api, { entries, options, expectedActions: JSON.stringify(plan.actions) });
+  const reloadedApi = createDemoApi(storage);
+  assert.equal((await reloadedApi.bookmarks.get('11'))[0].title, 'Revised Figma title');
+  assert.deepEqual((await getHistory(reloadedApi))[0], job);
+  const restored = await undoImport(reloadedApi, job.id);
+  assert.equal(restored.removed, 2);
+  assert.equal(restored.restored, 1);
+  assert.deepEqual(await createDemoApi(storage).bookmarks.getTree(), before);
+  assert.equal((await reloadedApi.storage.local.get(null)).tree, undefined);
+});
+
+test('demo storage filters keys, reports requested byte usage, and keeps unrelated data', async () => {
+  const storage = memoryStorage();
+  storage.setItem('another-app', 'unrelated');
+  const api = createDemoApi(storage);
+  await api.storage.local.set({ first: { value: 'one' }, second: ['two'] });
+  assert.deepEqual(await api.storage.local.get(['first']), { first: { value: 'one' } });
+  const firstBytes = await api.storage.local.getBytesInUse('first');
+  const secondBytes = await api.storage.local.getBytesInUse(['second']);
+  assert.equal(await api.storage.local.getBytesInUse(null), firstBytes + secondBytes);
+  assert.equal(await api.storage.local.getBytesInUse('missing'), 0);
+  await api.storage.local.remove(['first']);
+  assert.deepEqual(await api.storage.local.get(null), { second: ['two'] });
+  assert.equal(storage.getItem('another-app'), 'unrelated');
+});
+
+test('the background worker reuses its manager tab and serializes bookmark operations', async () => {
+  const mock = makeApi();
+  const payload = await mock.preview([entry(bookmark('WorkerImport'))]);
+  const previousChrome = globalThis.chrome;
+  let messageListener;
+  let actionListener;
+  const tabChanges = [];
+  const windowChanges = [];
+  const extensionId = 'test-extension';
+  const managerUrl = `chrome-extension://${extensionId}/manager.html`;
+  globalThis.chrome = {
+    ...mock.api,
+    runtime: {
+      id: extensionId,
+      getURL: path => `chrome-extension://${extensionId}/${path}`,
+      onMessage: { addListener: listener => { messageListener = listener; } },
+    },
+    action: { onClicked: { addListener: listener => { actionListener = listener; } } },
+    tabs: {
+      query: async () => [{ id: 7, windowId: 4, url: managerUrl }],
+      update: async (...args) => { tabChanges.push(args); },
+      create: async details => { tabChanges.push(details); },
+    },
+    windows: { update: async (...args) => { windowChanges.push(args); } },
+  };
+  try {
+    await import('../background.js');
+    await actionListener();
+    assert.deepEqual(tabChanges, [[7, { active: true }]]);
+    assert.deepEqual(windowChanges, [[4, { focused: true }]]);
+    assert.equal(messageListener({ type: 'import', payload }, { id: 'another-extension' }, () => assert.fail('Foreign messages must be ignored')), undefined);
+
+    const getTree = mock.api.bookmarks.getTree;
+    let releaseTree;
+    const treeGate = new Promise(resolve => { releaseTree = resolve; });
+    mock.api.bookmarks.getTree = async () => { await treeGate; return getTree(); };
+    let resolveFirst;
+    const firstResult = new Promise(resolve => { resolveFirst = resolve; });
+    assert.equal(messageListener({ type: 'import', payload }, { id: extensionId }, resolveFirst), true);
+    let overlappingResponse;
+    messageListener({ type: 'import', payload }, { id: extensionId }, response => { overlappingResponse = response; });
+    assert.equal(overlappingResponse.ok, false);
+    assert.match(overlappingResponse.error, /operation is running/);
+    releaseTree();
+    const completed = await firstResult;
+    assert.equal(completed.ok, true);
+    await Promise.resolve();
+    const undoResult = await new Promise(resolve => {
+      assert.equal(messageListener({ type: 'undo', id: completed.result.id }, { id: extensionId }, resolve), true);
+    });
+    assert.equal(undoResult.ok, true);
+    assert.equal(undoResult.result.status, 'undone');
+    await Promise.resolve();
+  } finally {
+    if (previousChrome === undefined) delete globalThis.chrome;
+    else globalThis.chrome = previousChrome;
+  }
 });
